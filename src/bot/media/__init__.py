@@ -1,0 +1,76 @@
+"""Multimodal media processing package."""
+
+from bot.media.audio import (
+    AudioProcessingError,
+    extract_audio_from_video,
+    extract_keyframe_from_video,
+    extract_video_note_assets,
+    resolve_ffmpeg_path,
+    transcode_voice_to_wav,
+)
+from bot.media.documents import (
+    FileTooLargeError,
+    check_file_size,
+    extract_document_text,
+    extract_docx_text,
+    extract_pdf_text,
+    extract_plain_text,
+)
+from bot.media.processor import MediaProcessor, ProcessedMedia
+from bot.media.stt import (
+    STTDurationError,
+    STTError,
+    STTLanguageError,
+    STTResult,
+    STTTimeoutError,
+    STTTranscriber,
+    STTUnavailableError,
+    is_stt_available,
+    load_wav_audio,
+    probe_wav_duration,
+)
+from bot.media.tts import (
+    TTSError,
+    TTSResult,
+    TTSSkippedError,
+    TTSSynthesizer,
+    detect_speech_language,
+    probe_audio_duration,
+    sanitize_text_for_tts,
+    transcode_to_telegram_voice,
+)
+
+__all__ = [
+    "MediaProcessor",
+    "ProcessedMedia",
+    "extract_document_text",
+    "extract_pdf_text",
+    "extract_docx_text",
+    "extract_plain_text",
+    "check_file_size",
+    "FileTooLargeError",
+    "resolve_ffmpeg_path",
+    "transcode_voice_to_wav",
+    "extract_audio_from_video",
+    "extract_keyframe_from_video",
+    "extract_video_note_assets",
+    "AudioProcessingError",
+    "STTError",
+    "STTUnavailableError",
+    "STTDurationError",
+    "STTTimeoutError",
+    "STTLanguageError",
+    "STTResult",
+    "STTTranscriber",
+    "is_stt_available",
+    "load_wav_audio",
+    "probe_wav_duration",
+    "TTSError",
+    "TTSSkippedError",
+    "TTSResult",
+    "TTSSynthesizer",
+    "detect_speech_language",
+    "sanitize_text_for_tts",
+    "transcode_to_telegram_voice",
+    "probe_audio_duration",
+]

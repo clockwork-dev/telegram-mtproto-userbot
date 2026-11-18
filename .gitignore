@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Pytest & Ruff caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# Environment variables and secrets
+.env
+*.env
+!.env.example
+config/userbot.yaml
+config/userbot_system_prompt.md
+config/friends.yaml
+!*.example
+!*.example.md
+
+# Telegram MTProto sessions (CRITICAL: never commit)
+*.session
+*.session-journal
+*.session*
+
+# Antigravity OAuth tokens & isolated account data (CRITICAL: never commit)
+*oauth-token*
+jetski-standalone-oauth-token
+antigravity-oauth-token
+oauth-token
+
+# Bot runtime data directory (sessions, SQLite DB, isolated agy home, temp media)
+data/
+tmp/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

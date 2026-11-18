@@ -1,0 +1,22 @@
+[Unit]
+Description=Autonomous Telegram MTProto Userbot Agent (Antigravity SDK)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/telegram-mtproto-userbot/data/session/userbot.session
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/telegram-mtproto-userbot
+EnvironmentFile=-/opt/telegram-mtproto-userbot/.env
+Environment="SSH_CONNECTION=127.0.0.1 0 127.0.0.1 22"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/telegram-mtproto-userbot/.venv/bin/telegram-group-bot run --config /opt/telegram-mtproto-userbot/config/userbot.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

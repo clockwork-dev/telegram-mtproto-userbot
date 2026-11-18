@@ -1,0 +1,118 @@
+# Production Userbot Configuration Template (MTProto / Telethon)
+# Autonomous Telegram MTProto Userbot Agent (Antigravity SDK)
+
+telegram:
+  # Userbot mode utilizes Telethon MTProto client with an authorized session file
+  mode: "userbot"
+  # API credentials from https://my.telegram.org (can also be supplied via TELEGRAM_API_ID / TELEGRAM_API_HASH in .env)
+  api_id: 12345678
+  api_hash: "0123456789abcdef0123456789abcdef"
+  phone: null
+  session_path: "data/session/userbot.session"
+  # Group chats: kept empty during DM testing phase; uncomment group ID when activating group participation
+  allowed_chat_ids: []
+    # - -100XXXXXXXXXX  # Target supergroup ID
+  # Whitelisted DMs: bot responds only to explicit user IDs in private chats
+  allowed_dm_user_ids: []
+    # - 123456789  # Owner/admin user ID
+  # Anti-loop prevention: strictly ignore messages from specific bots
+  ignored_sender_usernames: []
+    # - "other_bot_username"
+
+behavior:
+  # Distinct persona names to avoid cross-bot confusion
+  bot_names:
+    - "Джефф"
+    - "jeff"
+  typing_simulation: true
+  typing_speed_cpm: 300
+  typing_min_seconds: 1.5
+  typing_max_seconds: 8.0
+  reactions_enabled: true
+  spontaneous_replies:
+    enabled: true
+    min_interval_seconds: 300
+    probability: 0.15
+    max_per_hour: 3
+    active_conversation_window_seconds: 60
+
+quiet_hours:
+  enabled: true
+  start: "22:00"
+  end: "08:00"
+  timezone: "Europe/Kyiv"
+
+proactive:
+  # Disabled by default during private DM testing phase
+  enabled: false
+  quiet_hours:
+    enabled: true
+    start: "22:00"
+    end: "08:00"
+    timezone: "Europe/Kyiv"
+  silence_trigger_hours: 6.0
+  scheduled_interval_minutes: 180
+  jitter_minutes: 45
+  cooldown_minutes: 90
+  humor_style: "friendly_sarcasm"
+  forbidden_topics:
+    - "тяжелые болезни"
+    - "личные финансы"
+    - "тема Польши и поляков"
+    - "личные отношения и бывшие партнёры"
+  cron_digests:
+    - id: "morning_digest"
+      enabled: true
+      cron: "0 9 * * *"
+      timezone: "Europe/Kyiv"
+      slot_label: "morning"
+      respect_quiet_hours: true
+      topics:
+        - "world news"
+        - "technology and IT"
+      prompt_hint: "Morning summary of key news with dry wit."
+    - id: "evening_digest"
+      enabled: true
+      cron: "0 20 * * *"
+      timezone: "Europe/Kyiv"
+      slot_label: "evening"
+      respect_quiet_hours: true
+      topics:
+        - "daily wrap-up"
+        - "technology and AI"
+      prompt_hint: "Evening wrap-up of the day."
+
+media:
+  max_doc_size_mb: 10
+  temp_dir: "data/tmp"
+  # Null will auto-resolve ffmpeg from system PATH (e.g. /usr/local/bin/ffmpeg)
+  ffmpeg_path: null
+
+memory:
+  db_path: "data/memory.sqlite"
+  short_term_limit: 30
+  compaction_threshold: 100
+  compaction_batch_size: 50
+
+voice:
+  tts:
+    enabled: true
+    ru_voice: "ru-RU-SvetlanaNeural"
+    uk_voice: "uk-UA-PolinaNeural"
+    rate: "+0%"
+    pitch: "+0Hz"
+    max_chars: 600
+    timeout_sec: 25.0
+    reply_voice_to_voice: true
+  stt:
+    enabled: true
+    model_size: "base"
+    compute_type: "int8"
+    cpu_threads: 2
+    max_duration_sec: 120
+    timeout_sec: 45.0
+    allowed_languages:
+      - "ru"
+      - "uk"
+    # Shared model directory (can be symlinked from /opt/telegram-group-bot/data/models/whisper)
+    model_dir: "data/models/whisper"
