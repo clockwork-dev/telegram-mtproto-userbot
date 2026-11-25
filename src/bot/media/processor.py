@@ -179,16 +179,47 @@ class MediaProcessor:
 
         raise RuntimeError("Neither client nor message provided a valid download mechanism.")
 
-    async def _run_ffmpeg_frame_extract(self, cmd: list[str]) -> bool:
-        """Run an FFmpeg command asynchronously and return True if it exited with 0."""
+    async def _run_ffmpeg_frame_extract(
+        self,
+        cmd: list[str],
+        timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Run an FFmpeg command asynchronously with timeout and cleanup, returning True on exit 0."""
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
+            await asyncio.wait_for(
+                proc.communicate(),
+                timeout=max(1.0, float(timeout_seconds)),
+            )
             return proc.returncode == 0
+        except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            logger.warning("FFmpeg frame extraction timed out after %.1fs", timeout_seconds)
+            return False
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            raise
         except Exception as exc:
             logger.debug("FFmpeg frame extraction command failed: %s", exc)
             return False

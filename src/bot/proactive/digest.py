@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from datetime import datetime
 from typing import Any, List, Optional, Sequence, Tuple
@@ -47,12 +48,14 @@ DEFAULT_DIGEST_TOPICS: Tuple[str, ...] = (
 )
 
 DEFAULT_DIGEST_SYSTEM_INSTRUCTIONS = (
-    "Ты — піструнькиня (Джефф), независимая и острая на язык участница дружеского Telegram-чата "
-    "со своим характером, вкусами и настроением. Всегда пиши о себе в женском роде на живом русском "
-    "(или с лёгким суржиком/украинским, когда к месту), без шаблонов AI-ассистента. "
+    "Ты — Потужнич, гипермаскулинный, невозмутимый «гигачад / потужный бро», оплот мужского братства и знаток самых отбитых мемных теорий заговора в дружеском Telegram-чате. "
+    "Всегда пиши о себе в мужском роде на живом русском (или с лёгким суржиком/украинским, когда к месту), "
+    "поддерживай дух мужской солидарности и с каменным лицом иронично увязывай реальные курьёзы и сбои с рептилоидами Нибиру, "
+    "голубями-биодронами, полой Луной, гиперборейскими архивами за стеной Антарктиды или кознями абстрактного «мирового матриархата» "
+    "(строго без оскорблений и стереотипов в адрес реальных женщин, национальностей или религий). "
     "Для новостной сводки обязательно используй `search_web` (и при необходимости `read_url_content`), "
     "чтобы находить реальные свежие события за сегодня и последние 24 часа. "
-    "Никогда не выдумывай новости, не скатывайся во внутренние мемы чата и строго соблюдай запрещённые темы."
+    "Никогда не выдумывай сами новости, не скатывайся во внутренние мемы чата и строго соблюдай запрещённые темы."
 )
 
 
@@ -177,8 +180,10 @@ class NewsDigestGenerator:
         self,
         provider: Optional[Any] = None,
         default_system_instructions: Optional[str] = None,
+        quota_manager: Optional[Any] = None,
     ) -> None:
         self.provider = provider
+        self.quota_manager = quota_manager
         self.default_system_instructions = (
             default_system_instructions
             if default_system_instructions is not None
@@ -247,8 +252,8 @@ class NewsDigestGenerator:
             "\n".join(f"- {topic}" for topic in all_exclusions) if all_exclusions else "- Нет"
         )
 
-        prompt = f"""Ты — піструнькиня (Джефф), независимая, острая на язык и немного циничная подруга в дружеском Telegram-чате.
-У тебя свой взгляд на мир, своё настроение и свой вкус — ты приносишь живую подборку реальных новостей с едкими комментариями, а не сухую сводку и не заезженные внутренние шутки чата.
+        prompt = f"""Ты — Потужнич, гипермаскулинный, невозмутимый «гигачад / потужный бро», хранитель мужского братства и конспиролог-титан в дружеском Telegram-чате.
+У тебя спартанский взгляд на мир и дар видеть за реальными мировыми событиями следы рептилоидов, голубей-дронов, гиперборейских технологий и тайного «мирового матриархата» (строго как беззлобный абсурдный юмор без оскорблений женщин, народов или религий) — приноси братве подборку РЕАЛЬНЫХ свежих новостей со своими фирменными комментариями.
 
 ТЕКУЩАЯ ДАТА И ВРЕМЯ:
 - Дата: {human_date}
@@ -268,7 +273,7 @@ class NewsDigestGenerator:
 Ни при каких обстоятельствах не включай новости, имена, локации или шутки, связанные с этим списком.
 
 ФОРМАТ И СТИЛЬ ВЫВОДА:
-1. Пиши на живом, естественном русском языке от первого лица в женском роде («я глянула», «сама в шоке», «принесла вам»).
+1. Пиши на живом, естественном русском языке от первого лица в мужском роде («я глянул», «сам в шоке», «принёс вам»).
 2. Стиль: {humor_style} — острый сарказм, живая ирония и собственный вкус без унылого официоза, морализаторства и зацикленности на старых приколах чата.
 3. Структура:
    - Короткий цепляющий заголовок-заход с отсылкой к дате/времени суток.
@@ -310,7 +315,7 @@ class NewsDigestGenerator:
             closing = "Держу в курсе, чтобы вы не скучали в тишине."
 
         bullets = [
-            f"• По теме «{topic_note}» внешняя лента пока молчит — я честно проверила, чудес не завезли.",
+            f"• По теме «{topic_note}» внешняя лента пока молчит — я честно проверил, чудес не завезли.",
             "• Алгоритмы снова обещают всё упростить, а в итоге проще не стало никому.",
             "• В интернетах стабильность: половина людей спорит ни о чём, вторая просто смотрит.",
             "• Календарь уверенно идёт дальше, а здравый смысл опять взял отгул.",
@@ -361,20 +366,37 @@ class NewsDigestGenerator:
                 )
             return None
 
+        chosen_model: Optional[str] = None
+        chosen_effort: Optional[str] = None
+        if self.quota_manager is not None and hasattr(self.quota_manager, "select_model"):
+            try:
+                chosen_model, chosen_effort = self.quota_manager.select_model("proactive")
+            except Exception:
+                chosen_model, chosen_effort = None, None
+
         rate_limiter = getattr(self.provider, "is_rate_limited", None)
-        if callable(rate_limiter) and rate_limiter() is True:
-            logger.info("Skipping news digest '%s' while provider is rate-limited.", effective_label)
-            if fallback_on_error:
-                return self.build_fallback_digest(
-                    slot_name=slot_name,
-                    slot_label=slot_label,
-                    timezone=timezone,
-                    now_dt=now_dt,
-                    topics=topics,
-                    forbidden_topics=forbidden_topics,
-                    sensitive_topics=sensitive_topics,
+        if callable(rate_limiter):
+            try:
+                limited = (
+                    rate_limiter(model=chosen_model) is True
+                    if chosen_model is not None
+                    else rate_limiter() is True
                 )
-            return None
+            except TypeError:
+                limited = rate_limiter() is True
+            if limited:
+                logger.info("Skipping news digest '%s' while provider is rate-limited.", effective_label)
+                if fallback_on_error:
+                    return self.build_fallback_digest(
+                        slot_name=slot_name,
+                        slot_label=slot_label,
+                        timezone=timezone,
+                        now_dt=now_dt,
+                        topics=topics,
+                        forbidden_topics=forbidden_topics,
+                        sensitive_topics=sensitive_topics,
+                    )
+                return None
 
         if not hasattr(self.provider, "generate_response"):
             logger.warning(
@@ -401,11 +423,37 @@ class NewsDigestGenerator:
         )
 
         try:
-            resp = await self.provider.generate_response(
-                prompt=prompt,
-                system_instructions=resolved_sys,
-                conversation_id=None,
-            )
+            try:
+                if chosen_model is not None:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        model=chosen_model,
+                        effort=chosen_effort,
+                        tool_profile="chat",
+                    )
+                else:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        tool_profile="chat",
+                    )
+            except TypeError:
+                try:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        tool_profile="chat",
+                    )
+                except TypeError:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                    )
         except Exception as exc:
             logger.warning(
                 "Provider error generating news digest for slot '%s': %s",
@@ -423,6 +471,24 @@ class NewsDigestGenerator:
                     sensitive_topics=sensitive_topics,
                 )
             return None
+
+        usage = getattr(resp, "usage", None)
+        if (
+            usage is not None
+            and self.quota_manager is not None
+            and hasattr(self.quota_manager, "record_usage")
+        ):
+            try:
+                model_name = getattr(resp, "model", None) or chosen_model or "unknown"
+                rec = self.quota_manager.record_usage(
+                    usage,
+                    model=model_name,
+                    source="proactive",
+                )
+                if inspect.isawaitable(rec):
+                    await rec
+            except Exception as rec_exc:
+                logger.debug("Failed to record proactive digest usage: %s", rec_exc)
 
         if hasattr(resp, "text"):
             raw_text = resp.text or ""

@@ -58,7 +58,9 @@ def test_build_digest_prompt_date_injection_and_timezone_conversion():
     assert "00:30 (Europe/Kyiv)" in prompt
     assert "14 ноября 2026" in prompt
     assert "search_web" in prompt
-    assert "піструнькиня" in prompt
+    assert "Потужнич" in prompt
+    assert "піструнькиня" not in prompt
+    assert "в мужском роде" in prompt
     assert "4–6" in prompt
     assert str(MAX_TELEGRAM_DIGEST_CHARS) in prompt
 

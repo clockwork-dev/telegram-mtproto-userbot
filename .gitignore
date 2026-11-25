@@ -8,9 +8,10 @@ __pycache__/
 venv/
 env/
 
-# Pytest & Ruff caches
+# Pytest, Ruff & tool caches
 .pytest_cache/
 .ruff_cache/
+.cache/
 .coverage
 htmlcov/
 
@@ -20,14 +21,17 @@ dist/
 *.egg-info/
 src/*.egg-info/
 
-# Environment variables and secrets
+# Environment variables, live configs, and secrets
 .env
 *.env
 !.env.example
+!*.example
+wg0.conf
+*.key
 config/userbot.yaml
 config/userbot_system_prompt.md
+config/bot.yaml
 config/friends.yaml
-!*.example
 !*.example.md
 
 # Telegram MTProto sessions (CRITICAL: never commit)
@@ -45,6 +49,7 @@ oauth-token
 data/
 tmp/
 *.sqlite
+*.sqlite*
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm

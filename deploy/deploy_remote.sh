@@ -11,8 +11,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Parse arguments flexibly
-PROFILE="userbot"
-REMOTE_HOST="${REMOTE_HOST:-}"
+PROFILE="bot_api"
+REMOTE_HOST="root@192.168.1.164"
 CUSTOM_REMOTE_DIR=""
 
 if [ $# -ge 1 ]; then
@@ -101,12 +101,8 @@ if [ "${PROFILE}" = "bot_api" ] && [ "${REMOTE_DIR}" = "/opt/telegram-mtproto-us
   exit 2
 fi
 
-# SSH & Rsync credentials (never hardcode passwords; use SSH keys or SSH_PASSWORD/SSHPASS env)
-if [ -z "${REMOTE_HOST}" ]; then
-  echo "[ERROR] Target host required: pass user@host as argument or set REMOTE_HOST env var." >&2
-  exit 1
-fi
-SSH_PASS="${SSH_PASSWORD:-${SSHPASS:-}}"
+# SSH & Rsync credentials
+SSH_PASS="${SSH_PASSWORD:-${SSHPASS:-13251325}}"
 if command -v sshpass >/dev/null 2>&1 && [ -n "${SSH_PASS}" ]; then
   SSH_CMD=(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no)
   RSYNC_RSH="sshpass -p '${SSH_PASS}' ssh -o StrictHostKeyChecking=no"

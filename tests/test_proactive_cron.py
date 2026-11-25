@@ -257,9 +257,9 @@ def test_cron_digest_pydantic_validation_and_backward_compat():
 
 
 def test_repo_bot_yaml_loads_default_cron_digests():
-    """Verify userbot.example.yaml loads morning_digest and evening_digest via ConfigManager."""
+    """Verify bot.example.yaml (or bot.yaml) loads morning_digest and evening_digest via ConfigManager."""
     repo_config_dir = Path(__file__).resolve().parent.parent / "config"
-    mgr = ConfigManager(config_path=repo_config_dir / "userbot.example.yaml")
+    mgr = ConfigManager(config_path=repo_config_dir / "bot.example.yaml")
     assert mgr.bot is not None
 
     digests = {job.id: job for job in mgr.bot.proactive.cron_digests}

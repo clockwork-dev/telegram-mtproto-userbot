@@ -23,6 +23,8 @@ dependencies = [
     "edge-tts>=7.0.0",
     "faster-whisper>=1.1.0",
     "numpy>=1.26.0",
+    "google-genai>=1.0.0",
+    "qrcode>=7.4",
 ]
 
 [project.optional-dependencies]

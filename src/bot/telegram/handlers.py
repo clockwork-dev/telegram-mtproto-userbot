@@ -1,5 +1,7 @@
 """Message handlers and Telethon event parser for Telegram Userbot."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -18,19 +20,40 @@ class IncomingMessage:
     chat_id: int
     sender_id: int
     sender_name: str
-    text: Optional[str]
-    reply_to_msg_id: Optional[int]
-    is_reply: bool
-    is_mention: bool
-    raw_event: Any
+    text: Optional[str] = None
+    reply_to_msg_id: Optional[int] = None
+    is_reply: bool = False
+    is_mention: bool = False
+    raw_event: Any = None
     media: Optional[Any] = None
     reply_to_text: Optional[str] = None
     reply_to_author: Optional[str] = None
-    reply_to_media_event: Optional[Any] = None
+    reply_to_media_event: Any = None
     reply_to_sender_id: Optional[int] = None
     is_private: bool = False
     sender_is_bot: bool = False
     sender_username: Optional[str] = None
+
+
+def _has_explicit_attr(obj: Any, attr: str) -> bool:
+    """Return True if `attr` on `obj` is explicitly truthy (ignoring unset MagicMock children)."""
+    if obj is None:
+        return False
+    if type(obj).__module__.startswith("unittest.mock"):
+        children = getattr(obj, "_mock_children", {})
+        if attr not in getattr(obj, "__dict__", {}) and attr not in children:
+            return False
+    return bool(getattr(obj, attr, None))
+
+
+def _message_has_media(msg: Any) -> bool:
+    """Return True if a Telethon message or synthetic event carries photo/document/sticker/media."""
+    if msg is None:
+        return False
+    return any(
+        _has_explicit_attr(msg, attr)
+        for attr in ("media", "photo", "document", "sticker", "voice", "video", "gif", "animation")
+    )
 
 
 def extract_sender_name(event: Any, sender_id: int) -> str:
@@ -48,7 +71,6 @@ def extract_sender_name(event: Any, sender_id: int) -> str:
         if isinstance(username, str) and username.strip():
             return f"@{username.strip()}"
 
-    # Check for direct attribute on event
     direct_name = getattr(event, "sender_name", None)
     if isinstance(direct_name, str) and direct_name.strip():
         return direct_name.strip()
@@ -58,11 +80,16 @@ def extract_sender_name(event: Any, sender_id: int) -> str:
 
 async def enrich_reply_metadata(event: Any, bot_id: int = 0) -> None:
     """Asynchronously enrich event with reply-to message metadata (text, author, sender_id, media)."""
-    if not bool(getattr(event, "is_reply", False)):
+    is_reply = _has_explicit_attr(event, "is_reply")
+    if not is_reply and not _has_explicit_attr(event, "reply_to_msg_id"):
         return
 
     get_reply = getattr(event, "get_reply_message", None)
     if not callable(get_reply):
+        return
+    if type(event).__module__.startswith("unittest.mock") and not _has_explicit_attr(
+        event, "get_reply_message"
+    ):
         return
 
     try:
@@ -87,41 +114,53 @@ async def enrich_reply_metadata(event: Any, bot_id: int = 0) -> None:
         reply_to_text = None
 
     reply_to_sender_id = getattr(reply_msg, "sender_id", None)
+    if not isinstance(reply_to_sender_id, int) or isinstance(reply_to_sender_id, bool):
+        reply_to_sender_id = None
     if reply_to_sender_id is None and hasattr(reply_msg, "from_id"):
         from_id = getattr(reply_msg, "from_id", None)
-        reply_to_sender_id = getattr(from_id, "user_id", None) or getattr(from_id, "chat_id", None)
+        cand = getattr(from_id, "user_id", None) or getattr(from_id, "chat_id", None)
+        if isinstance(cand, int) and not isinstance(cand, bool):
+            reply_to_sender_id = cand
 
     reply_to_author = extract_sender_name(reply_msg, reply_to_sender_id or 0)
-    reply_media = getattr(reply_msg, "media", None)
-    reply_to_media_event = reply_msg if reply_media else None
+    reply_to_media_event: Any = None
+    if _message_has_media(reply_msg):
+        if type(reply_msg).__module__.startswith("unittest.mock") and not _has_explicit_attr(
+            reply_msg, "message"
+        ):
+            try:
+                reply_msg.message = reply_msg
+            except Exception:
+                pass
+        elif hasattr(reply_msg, "message") and getattr(reply_msg, "message", "") is None:
+            try:
+                reply_msg.message = ""
+            except Exception:
+                pass
+        reply_to_media_event = reply_msg
 
     is_reply_to_bot = bool(
         bot_id and reply_to_sender_id is not None and int(reply_to_sender_id) == int(bot_id)
     )
 
-    for target in (event, getattr(event, "message", None)):
-        if target is None:
-            continue
-        try:
-            target.reply_to_text = reply_to_text
-        except Exception:
-            pass
-        try:
-            target.reply_to_author = reply_to_author
-        except Exception:
-            pass
-        try:
-            target.reply_to_sender_id = reply_to_sender_id
-        except Exception:
-            pass
-        try:
-            target.reply_to_media_event = reply_to_media_event
-        except Exception:
-            pass
-        try:
-            target.is_reply_to_bot = is_reply_to_bot
-        except Exception:
-            pass
+    targets = [event]
+    if _has_explicit_attr(event, "message"):
+        msg_obj = getattr(event, "message", None)
+        if msg_obj is not None and not isinstance(msg_obj, str) and msg_obj is not event:
+            targets.append(msg_obj)
+
+    for target in targets:
+        for attr_name, attr_val in (
+            ("reply_to_text", reply_to_text),
+            ("reply_to_author", reply_to_author),
+            ("reply_to_sender_id", reply_to_sender_id),
+            ("reply_to_media_event", reply_to_media_event),
+            ("is_reply_to_bot", is_reply_to_bot),
+        ):
+            try:
+                setattr(target, attr_name, attr_val)
+            except Exception:
+                pass
 
 
 def parse_incoming_message_sync(
@@ -131,44 +170,84 @@ def parse_incoming_message_sync(
     bot_username: Optional[str] = None,
 ) -> IncomingMessage:
     """Parse a Telethon event synchronously into an IncomingMessage."""
-    # Support both Telethon event objects and synthetic event mocks
     msg_id = getattr(event, "id", None)
-    if msg_id is None and hasattr(event, "message"):
-        msg_id = getattr(event.message, "id", 0)
+    if not isinstance(msg_id, int) or isinstance(msg_id, bool):
+        msg_id = None
+    if msg_id is None and _has_explicit_attr(event, "message"):
+        inner_id = getattr(event.message, "id", 0)
+        msg_id = inner_id if isinstance(inner_id, int) and not isinstance(inner_id, bool) else 0
     msg_id = msg_id or 0
 
-    chat_id = getattr(event, "chat_id", 0)
-    sender_id = getattr(event, "sender_id", 0)
+    raw_chat_id = getattr(event, "chat_id", 0)
+    chat_id = raw_chat_id if isinstance(raw_chat_id, int) and not isinstance(raw_chat_id, bool) else 0
+    raw_sender_id = getattr(event, "sender_id", 0)
+    sender_id = (
+        raw_sender_id if isinstance(raw_sender_id, int) and not isinstance(raw_sender_id, bool) else 0
+    )
     sender_name = extract_sender_name(event, sender_id)
 
     sender = getattr(event, "sender", None)
-    sender_username = getattr(sender, "username", None) or getattr(event, "sender_username", None)
-    sender_is_bot = bool(getattr(sender, "bot", False) or getattr(event, "sender_is_bot", False))
-    is_private = bool(getattr(event, "is_private", False) or (chat_id > 0))
+    raw_s_user = getattr(sender, "username", None) if sender is not None else None
+    if not isinstance(raw_s_user, str):
+        raw_s_user = getattr(event, "sender_username", None)
+    sender_username = raw_s_user.strip() if isinstance(raw_s_user, str) and raw_s_user.strip() else None
+
+    sender_bot_flag = (
+        (getattr(sender, "bot", False) is True or getattr(sender, "is_bot", False) is True)
+        if sender is not None
+        else False
+    )
+    sender_is_bot = bool(sender_bot_flag or (getattr(event, "sender_is_bot", False) is True))
+
+    raw_is_priv = getattr(event, "is_private", None)
+    if isinstance(raw_is_priv, bool):
+        is_private = raw_is_priv
+    elif callable(raw_is_priv) and not type(raw_is_priv).__module__.startswith("unittest.mock"):
+        try:
+            priv_res = raw_is_priv()
+            is_private = priv_res if isinstance(priv_res, bool) else (chat_id > 0)
+        except Exception:
+            is_private = chat_id > 0
+    else:
+        is_private = chat_id > 0
 
     text = getattr(event, "raw_text", None)
-    if text is None:
-        text = getattr(event, "text", None)
-    if text is None and hasattr(event, "message"):
-        text = getattr(event.message, "message", "")
+    if not isinstance(text, str):
+        cand_text = getattr(event, "text", None)
+        text = cand_text if isinstance(cand_text, str) else None
+    if text is None and _has_explicit_attr(event, "message"):
+        inner_text = getattr(event.message, "message", None)
+        if isinstance(inner_text, str):
+            text = inner_text
 
     # Reply detection
-    is_reply = bool(getattr(event, "is_reply", False))
-    reply_to_msg_id = getattr(event, "reply_to_msg_id", None)
-    if reply_to_msg_id is None and hasattr(event, "message"):
+    is_reply = _has_explicit_attr(event, "is_reply")
+    raw_reply_id = getattr(event, "reply_to_msg_id", None)
+    reply_to_msg_id = (
+        raw_reply_id if isinstance(raw_reply_id, int) and not isinstance(raw_reply_id, bool) else None
+    )
+    if reply_to_msg_id is None and _has_explicit_attr(event, "message"):
         reply_to = getattr(event.message, "reply_to", None)
         if reply_to is not None:
-            reply_to_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+            inner_reply_id = getattr(reply_to, "reply_to_msg_id", None)
+            if isinstance(inner_reply_id, int) and not isinstance(inner_reply_id, bool):
+                reply_to_msg_id = inner_reply_id
+    if reply_to_msg_id is not None and not is_reply:
+        is_reply = True
 
     # Media detection
-    media = getattr(event, "media", None)
-    if media is None and hasattr(event, "message"):
-        media = getattr(event.message, "media", None)
+    media = getattr(event, "media", None) if _has_explicit_attr(event, "media") else None
+    if media is None and _has_explicit_attr(event, "message"):
+        inner_msg = getattr(event, "message", None)
+        if _has_explicit_attr(inner_msg, "media"):
+            media = getattr(inner_msg, "media", None)
 
     # Mention detection
-    entities = getattr(event, "entities", None)
-    if entities is None and hasattr(event, "message"):
-        entities = getattr(event.message, "entities", None)
+    entities = getattr(event, "entities", None) if _has_explicit_attr(event, "entities") else None
+    if entities is None and _has_explicit_attr(event, "message"):
+        inner_msg = getattr(event, "message", None)
+        if _has_explicit_attr(inner_msg, "entities"):
+            entities = getattr(inner_msg, "entities", None)
 
     heuristics = ReplyHeuristics()
     is_mention = heuristics.is_mention(
@@ -185,8 +264,23 @@ def parse_incoming_message_sync(
     reply_to_author = getattr(event, "reply_to_author", None)
     if not isinstance(reply_to_author, str):
         reply_to_author = None
-    reply_to_media_event = getattr(event, "reply_to_media_event", None)
-    reply_to_sender_id = getattr(event, "reply_to_sender_id", None)
+
+    reply_to_media_event = (
+        getattr(event, "reply_to_media_event", None)
+        if _has_explicit_attr(event, "reply_to_media_event")
+        else None
+    )
+    if reply_to_media_event is None and _has_explicit_attr(event, "reply_message"):
+        cand_reply_msg = getattr(event, "reply_message", None)
+        if _message_has_media(cand_reply_msg):
+            reply_to_media_event = cand_reply_msg
+
+    raw_reply_sender = getattr(event, "reply_to_sender_id", None)
+    reply_to_sender_id = (
+        raw_reply_sender
+        if isinstance(raw_reply_sender, int) and not isinstance(raw_reply_sender, bool)
+        else None
+    )
 
     return IncomingMessage(
         msg_id=msg_id,

@@ -1,0 +1,247 @@
+telegram:
+  mode: "userbot"
+  api_id: 12345678
+  api_hash: "0123456789abcdef0123456789abcdef"
+  phone: null
+  session_path: "data/session/userbot.session"
+  allowed_chat_ids:
+    - -1001234567890
+  allowed_dm_user_ids: []
+  admin_user_ids: []
+  ignored_sender_usernames:
+    - "other_bot_username"
+
+behavior:
+  bot_names:
+    - "Потужнич"
+    - "Потужный"
+    - "Потужний"
+    - "potuzhnych"
+  typing_simulation: true
+  typing_speed_cpm: 300
+  typing_min_seconds: 1.5
+  typing_max_seconds: 8.0
+  reactions_enabled: true
+  spontaneous_replies:
+    enabled: true
+    min_interval_seconds: 300
+    probability: 0.20
+    max_per_hour: 3
+    active_conversation_window_seconds: 90
+
+quiet_hours:
+  enabled: true
+  start: "23:00"
+  end: "08:00"
+  timezone: "Europe/Moscow"
+
+proactive:
+  enabled: true
+  quiet_hours:
+    enabled: true
+    start: "23:00"
+    end: "08:00"
+    timezone: "Europe/Moscow"
+  silence_trigger_hours: 6.0
+  scheduled_interval_minutes: 180
+  jitter_minutes: 45
+  cooldown_minutes: 90
+  humor_style: "friendly_sarcasm"
+  forbidden_topics:
+    - "политика"
+    - "религия"
+    - "тяжелые болезни"
+    - "личные финансы"
+  cron_digests:
+    - id: "morning_digest"
+      enabled: true
+      cron: "0 9 * * *"
+      timezone: "Europe/Kyiv"
+      slot_label: "morning"
+      respect_quiet_hours: true
+      topics:
+        - "мировые новости"
+        - "технологии и IT"
+      prompt_hint: "Утренняя сводка новостей за ночь и утро."
+    - id: "evening_digest"
+      enabled: true
+      cron: "0 20 * * *"
+      timezone: "Europe/Kyiv"
+      slot_label: "evening"
+      respect_quiet_hours: true
+      topics:
+        - "итоги дня в мире"
+        - "технологии и AI"
+      prompt_hint: "Вечерняя сводка итогов дня."
+
+media:
+  max_doc_size_mb: 10
+  temp_dir: "data/tmp"
+  ffmpeg_path: null
+
+memory:
+  db_path: "data/memory.sqlite"
+  short_term_limit: 30
+  compaction_threshold: 60
+  compaction_batch_size: 30
+  backup:
+    enabled: true
+    backup_dir: "data/backups"
+    interval_hours: 24.0
+    retain_count: 14
+    compress: true
+  embeddings:
+    enabled: true
+    provider: "gemini" # Semantic vector recall via Gemini embeddings (hybrid FTS5 + RRF)
+    gemini_model: "gemini-embedding-001"
+    gemini_api_key_env: "GEMINI_API_KEY" # Reads API key from environment / .env (never commit raw keys)
+    output_dimensionality: 768
+    timeout_seconds: 3.0
+    min_similarity: 0.52
+    query_cache_size: 128
+    backfill_batch_size: 20
+    cooldown_seconds: 120.0
+  reflection:
+    enabled: true # Periodic consolidation of redundant per-subject facts and TTL archival
+    interval_hours: 24.0
+    min_active_facts_per_subject: 15
+    max_subjects_per_cycle: 3
+    target_summary_facts: 4
+    subject_cooldown_hours: 72.0
+    agreement_default_ttl_days: 14
+    event_default_ttl_days: 30
+
+voice:
+  tts:
+    enabled: true
+    provider: "auto" # "auto" (Gemini when API key is set, else Edge), "gemini", or "edge"
+    fallback_to_edge: true
+    ru_voice: "ru-RU-DmitryNeural"
+    uk_voice: "uk-UA-OstapNeural"
+    rate: "+0%"
+    pitch: "+0Hz"
+    max_chars: 600
+    timeout_sec: 25.0
+    reply_voice_to_voice: true
+    gemini_model: "gemini-2.5-flash-preview-tts"
+    gemini_ru_voice: "Fenrir"
+    gemini_uk_voice: "Fenrir"
+    gemini_style_prompt: "Grounded, confident, hyper-masculine guy (Potuzhnych) speaking naturally at normal conversational distance; resonant chest tone, composed stoic authority, dry ironic punch, natural breaths and unhurried spoken timing in crisp Russian/Ukrainian—never robotic, monotone, ASMR-whispering, flirtatious, or theatrical."
+    gemini_api_key_env: "GEMINI_API_KEY"
+  stt:
+    enabled: true
+    model_size: "base"
+    compute_type: "int8"
+    cpu_threads: 2
+    max_duration_sec: 120
+    timeout_sec: 45.0
+    allowed_languages:
+      - "ru"
+      - "uk"
+    model_dir: "data/models/whisper"
+
+image_generation:
+  enabled: true
+  allow_natural_language_trigger: true
+  timeout_seconds: 120.0
+  max_prompt_chars: 1000
+  max_per_user_per_hour: 5
+  user_cooldown_seconds: 30.0
+  max_per_chat_per_hour: 15
+  admin_bypass_limits: true
+  output_dir: "data/tmp/images"
+  max_image_size_mb: 20.0
+  send_as_document_threshold_mb: 9.5
+  model: null
+  cleanup_after_send: true
+
+antigravity:
+  data_dir: "data/antigravity"
+  model: "gemini-4-hydrogen"
+  effort: "low"
+  enable_sdk: false # Keep false when GEMINI_API_KEY is set for Gemini TTS so chat stays on OAuth agy CLI
+  enable_cli_fallback: true
+  max_retries: 3
+  rate_limit_max_retries: 0
+  rate_limit_cooldown_seconds: 300.0
+  backoff_base: 1.0
+  backoff_max: 30.0
+  ops_mode: "auto"
+  self_dev_mode: "auto"
+  ops_cwd: null
+  ops_workspace_dir: "data/ops_workspace"
+  ops_tools_default_mode: "on"
+
+models:
+  group:
+    model: "gemini-3.8-flash"
+    effort: "low"
+  proactive:
+    model: "gemini-3.8-flash"
+    effort: "low"
+  compaction:
+    model: "gemini-3.8-flash"
+    effort: "low"
+  dm_admin:
+    model: "gemini-4-hydrogen"
+    effort: "medium"
+  self_edit_judge:
+    model: "gemini-4-hydrogen"
+    effort: "high"
+  self_edit:
+    model: "claude-sonnet-5-5"
+    effort: "high"
+  fallback_models:
+    - model: "gemini-3.8-flash"
+      effort: "low"
+    - model: "gemini-4-hydrogen"
+      effort: "low"
+    - model: "claude-sonnet-5-5"
+      effort: "medium"
+    - model: "gpt-oss-120b-medium"
+      effort: null
+
+quota:
+  enabled: true
+  hourly_token_budget: 300000
+  daily_token_budget: 2500000
+  admin_reserve_ratio: 0.20
+  economy_threshold_ratio: 0.75
+  default_cooldown_seconds: 300.0
+  buckets:
+    gemini_models:
+      - "gemini-3.8-flash"
+      - "gemini-4-hydrogen"
+    claude_gpt:
+      - "claude-sonnet-5-5"
+      - "claude-opus-5-5"
+      - "gpt-oss-120b"
+    gemini_argon:
+      - "gemini-4-argon"
+      - "gemini-pro-orchestrator"
+
+self_evolution:
+  enabled: false
+  staging_dir: "/opt/telegram-mtproto-userbot-staging"
+  trigger_dir: "data/self_deploy"
+  max_daily_edits: 2
+  signature_cooldown_seconds: 21600
+  file_cooldown_seconds: 14400
+  error_threshold_count: 3
+  error_window_seconds: 1800
+  max_diff_lines: 400
+  canary_wait_seconds: 18
+  protected_paths:
+    - ".env"
+    - "data/"
+    - "config/userbot.yaml"
+    - "config/bot.yaml"
+    - "config/friends.yaml"
+    - "deploy/bot-self-deploy.sh"
+    - "systemd/"
+  escalation_models:
+    - "gemini-4-hydrogen"
+    - "claude-sonnet-5-5"
+    - "claude-opus-5-5"
+  self_edit_effort: "high"
+  judge_effort: "high"

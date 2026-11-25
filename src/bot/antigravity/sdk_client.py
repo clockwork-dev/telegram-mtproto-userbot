@@ -19,6 +19,7 @@ from bot.antigravity.errors import (
     AntigravityRateLimitError,
     classify_error,
 )
+from bot.antigravity.stream import ToolProfile, resolve_allowed_tools
 from bot.core.models import MediaAttachment, ProviderResponse, UsageInfo
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,20 @@ def has_gemini_api_key() -> bool:
     return bool(os.environ.get("GEMINI_API_KEY", "").strip())
 
 
+_SDK_CHAT_TOOLS: list[str] = ["search_web", "read_url_content"]
+_SDK_OPS_TOOLS: list[str] = [
+    "search_web",
+    "read_url_content",
+    "list_directory",
+    "search_directory",
+    "find_file",
+    "view_file",
+    "create_file",
+    "edit_file",
+    "run_command",
+]
+
+
 class AntigravitySDKClient:
     """Direct Python integration with google-antigravity SDK."""
 
@@ -69,8 +84,12 @@ class AntigravitySDKClient:
         media_attachments: Sequence[MediaAttachment] | None = None,
         conversation_id: str | None = None,
         model: str | None = None,
+        tool_profile: ToolProfile = "chat",
+        mode: str | None = None,
+        cwd: Path | str | None = None,
     ) -> ProviderResponse:
         """Execute chat turn using direct Agent SDK with tool interception and isolation."""
+        resolve_allowed_tools(tool_profile)
         if not has_gemini_api_key() and getattr(Agent, "__module__", "").startswith("google."):
             raise AntigravityError(
                 "Direct SDK requires GEMINI_API_KEY; using OAuth CLI transport instead."
@@ -97,19 +116,26 @@ class AntigravitySDKClient:
 
         chat_input = prompt_items if len(prompt_items) > 1 else prompt
 
-        # Strict capabilities configuration: allow only safe web search tools
+        enabled_sdk_tools = (
+            list(_SDK_OPS_TOOLS)
+            if tool_profile in ("ops", "self_dev")
+            else list(_SDK_CHAT_TOOLS)
+        )
         caps = CapabilitiesConfig(
-            enable_subagents=False,
-            enabled_tools=["search_web", "read_url_content"],
+            enable_subagents=(tool_profile in ("ops", "self_dev")),
+            enabled_tools=enabled_sdk_tools,
         )
 
-        agent_config = LocalAgentConfig(
-            model=resolved_model,
-            system_instructions=system_instructions,
-            capabilities=caps,
-            conversation_id=conversation_id,
-            env=clean_env,
-        )
+        agent_kwargs: dict[str, Any] = {
+            "model": resolved_model,
+            "system_instructions": system_instructions,
+            "capabilities": caps,
+            "conversation_id": conversation_id,
+            "env": clean_env,
+        }
+        if cwd is not None:
+            agent_kwargs["workspaces"] = [str(Path(cwd).resolve())]
+        agent_config = LocalAgentConfig(**agent_kwargs)
 
         # Temporary env patching so any internal Go/keyring checks use isolated home
         old_env = dict(os.environ)
@@ -143,6 +169,8 @@ class AntigravitySDKClient:
                         total_tokens=getattr(meta, "total_token_count", 0) or 0,
                         reasoning_tokens=getattr(meta, "thoughts_token_count", 0) or 0,
                         cached_tokens=getattr(meta, "cached_content_token_count", 0) or 0,
+                        input_tokens=getattr(meta, "prompt_token_count", 0) or 0,
+                        output_tokens=getattr(meta, "candidates_token_count", 0) or 0,
                     )
 
                 return ProviderResponse(

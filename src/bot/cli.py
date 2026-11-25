@@ -13,7 +13,8 @@ from typing import Optional, Sequence
 
 from bot.antigravity.auth import run_isolated_antigravity_login
 from bot.config.manager import ConfigManager
-from bot.main import run_daemon, run_dry_run_smoke
+from bot.main import build_antigravity_config, run_daemon, run_dry_run_smoke
+from bot.security.sanitizer import SecretSanitizer, install_log_sanitizer
 from bot.telegram.auth import interactive_auth
 
 
@@ -102,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file",
         default=None,
         help="Optional path to .env file to load credentials from.",
+    )
+    p_tg.add_argument(
+        "--qr",
+        action="store_true",
+        help="Authenticate by scanning a QR code in the terminal (no SMS/login code needed).",
     )
 
     # 3. run
@@ -207,6 +213,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logging verbosity level (default: INFO).",
     )
 
+    # 6. backup-memory
+    p_backup = subparsers.add_parser(
+        "backup-memory",
+        help="Create a hot SQLite backup of the bot memory database with retention pruning.",
+    )
+    p_backup.add_argument(
+        "--config",
+        default="config/bot.yaml",
+        help="Path to bot.yaml configuration file (default: config/bot.yaml).",
+    )
+    p_backup.add_argument(
+        "--db",
+        default=None,
+        help="Override path to SQLite database (defaults to memory.db_path in config).",
+    )
+    p_backup.add_argument(
+        "--output-dir",
+        default=None,
+        help="Override backup directory (defaults to memory.backup.backup_dir in config).",
+    )
+    p_backup.add_argument(
+        "--retain",
+        type=int,
+        default=None,
+        help="Number of recent backups to retain (defaults to memory.backup.retain_count).",
+    )
+    p_backup.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Store uncompressed .sqlite snapshot instead of .sqlite.gz.",
+    )
+
+    # 7. restore-memory
+    p_restore = subparsers.add_parser(
+        "restore-memory",
+        help="Verify and restore a SQLite memory backup (creates a .pre-restore safety copy).",
+    )
+    p_restore.add_argument(
+        "--backup",
+        required=True,
+        help="Path to .sqlite or .sqlite.gz backup file to restore.",
+    )
+    p_restore.add_argument(
+        "--config",
+        default="config/bot.yaml",
+        help="Path to bot.yaml configuration file (default: config/bot.yaml).",
+    )
+    p_restore.add_argument(
+        "--db",
+        default=None,
+        help="Override target SQLite database path (defaults to memory.db_path in config).",
+    )
+
     return parser
 
 
@@ -290,29 +349,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 1
 
-        interactive_auth(
-            session_path=str(session_path),
-            api_id=int(api_id),
-            api_hash=str(api_hash),
-            phone=phone,
-        )
-        return 0
+        auth_call_kwargs: dict[str, object] = {
+            "session_path": str(session_path),
+            "api_id": int(api_id),
+            "api_hash": str(api_hash),
+            "phone": phone,
+        }
+        if getattr(args, "qr", False):
+            auth_call_kwargs["qr"] = True
+        ok = interactive_auth(**auth_call_kwargs)  # type: ignore[arg-type]
+        return 0 if ok is not False else 1
 
     if args.command == "run":
+        loaded_env_paths: list[Path] = []
         env_file_arg = getattr(args, "env_file", None)
         if env_file_arg:
-            load_dotenv_if_present(Path(env_file_arg))
+            p = Path(env_file_arg)
+            load_dotenv_if_present(p)
+            if p.is_file():
+                loaded_env_paths.append(p)
         else:
-            load_dotenv_if_present()
+            default_env = Path(".env")
+            load_dotenv_if_present(default_env)
+            if default_env.is_file():
+                loaded_env_paths.append(default_env)
             cfg_file = Path(args.config).resolve()
             for candidate_env in (cfg_file.parent.parent / ".env", cfg_file.parent / ".env"):
                 if candidate_env.is_file():
                     load_dotenv_if_present(candidate_env)
+                    loaded_env_paths.append(candidate_env)
 
         logging.basicConfig(
             level=getattr(logging, str(args.log_level).upper(), logging.INFO),
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
+        sanitizer = SecretSanitizer()
+        for env_p in loaded_env_paths:
+            sanitizer.load_env_file(env_p)
+        install_log_sanitizer(sanitizer)
+
         if args.dry_run:
             result = asyncio.run(run_dry_run_smoke(config_path=args.config))
             print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -329,7 +404,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         cfg_file = Path(args.config).resolve()
         config_dir = cfg_file.parent if cfg_file.is_file() else Path("config").resolve()
-        cfg_mgr = ConfigManager(config_dir=config_dir)
+        cfg_mgr = (
+            ConfigManager(config_path=cfg_file)
+            if cfg_file.is_file()
+            else ConfigManager(config_dir=config_dir)
+        )
         db_path = args.db or (cfg_mgr.bot.memory.db_path if cfg_mgr.bot else "data/memory.sqlite")
         friends_cfg = cfg_mgr.friends
         author_map = {
@@ -352,12 +431,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps([asdict(s) for s in stats], ensure_ascii=False, indent=2))
         return 0
 
+    if args.command == "backup-memory":
+        from bot.memory.backup import backup_sqlite_database
+
+        cfg_file = Path(args.config).resolve()
+        cfg_mgr = (
+            ConfigManager(config_path=cfg_file)
+            if cfg_file.is_file()
+            else ConfigManager(config_dir=cfg_file.parent if cfg_file.parent.exists() else Path("config").resolve())
+        )
+        bot_cfg = cfg_mgr.bot
+        db_path = args.db or (bot_cfg.memory.db_path if bot_cfg else "data/memory.sqlite")
+        backup_dir = args.output_dir or (bot_cfg.memory.backup.backup_dir if bot_cfg else "data/backups")
+        retain = args.retain if args.retain is not None else (bot_cfg.memory.backup.retain_count if bot_cfg else 14)
+        compress = False if args.no_compress else (bot_cfg.memory.backup.compress if bot_cfg else True)
+
+        res = backup_sqlite_database(db_path, backup_dir, compress=compress, retain=retain)
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "backup_path": str(res.backup_path),
+                    "source_db_path": str(res.source_db_path),
+                    "size_bytes": res.size_bytes,
+                    "compressed": res.compressed,
+                    "pruned_count": res.pruned_count,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "restore-memory":
+        from bot.memory.backup import restore_sqlite_database
+
+        cfg_file = Path(args.config).resolve()
+        cfg_mgr = (
+            ConfigManager(config_path=cfg_file)
+            if cfg_file.is_file()
+            else ConfigManager(config_dir=cfg_file.parent if cfg_file.parent.exists() else Path("config").resolve())
+        )
+        bot_cfg = cfg_mgr.bot
+        target_db = args.db or (bot_cfg.memory.db_path if bot_cfg else "data/memory.sqlite")
+        restored = restore_sqlite_database(args.backup, target_db)
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "restored_db_path": str(restored),
+                    "backup_path": str(Path(args.backup).resolve()),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
     if args.command == "run-digest":
         import time as time_mod
         from datetime import datetime, timedelta
         from datetime import timezone as dt_timezone
 
-        from bot.antigravity import AntigravityConfig, AntigravityProvider
+        from bot.antigravity import AntigravityProvider
         from bot.main import GroupBotOrchestrator
         from bot.memory.db import ChatMessage, MemoryStore
         from bot.proactive.cron import CronExpression, parse_timezone
@@ -369,18 +505,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         from bot.telegram.client import TelegramUserbot
 
+        cfg_file = Path(args.config).resolve()
+        loaded_env_paths = []
+        default_env = Path(".env")
+        load_dotenv_if_present(default_env)
+        if default_env.is_file():
+            loaded_env_paths.append(default_env)
+        for candidate_env in (cfg_file.parent.parent / ".env", cfg_file.parent / ".env"):
+            if candidate_env.is_file():
+                load_dotenv_if_present(candidate_env)
+                loaded_env_paths.append(candidate_env)
+
         logging.basicConfig(
             level=getattr(logging, str(args.log_level).upper(), logging.INFO),
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
+        sanitizer = SecretSanitizer()
+        for env_p in loaded_env_paths:
+            sanitizer.load_env_file(env_p)
+        install_log_sanitizer(sanitizer)
 
-        cfg_file = Path(args.config).resolve()
         config_dir = cfg_file.parent if cfg_file.is_file() else Path("config").resolve()
-        cfg_mgr = ConfigManager(config_dir=config_dir)
+        cfg_mgr = (
+            ConfigManager(config_path=cfg_file)
+            if cfg_file.is_file()
+            else ConfigManager(config_dir=config_dir)
+        )
         bot_cfg = cfg_mgr.bot
         if bot_cfg is None:
             print("[ERROR] Failed to load bot configuration.", file=sys.stderr)
             return 1
+        if bot_cfg.telegram.api_hash and "0123456789abcdef" not in bot_cfg.telegram.api_hash.lower():
+            sanitizer.register_secret(bot_cfg.telegram.api_hash)
+        if bot_cfg.telegram.phone and len(str(bot_cfg.telegram.phone).strip()) >= 7:
+            sanitizer.register_secret(str(bot_cfg.telegram.phone).strip())
 
         proactive_cfg = bot_cfg.proactive
         jobs = list(proactive_cfg.cron_digests or [])
@@ -436,7 +594,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             store = MemoryStore(db_path=str(db_path))
             await store.init_db()
 
-            provider = None if args.dry_run else AntigravityProvider(AntigravityConfig())
+            provider = (
+                None if args.dry_run else AntigravityProvider(build_antigravity_config(bot_cfg))
+            )
             digest_gen = NewsDigestGenerator(provider=provider)
 
             tg_client = None
@@ -452,6 +612,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 target_all = list(dict.fromkeys(target_all))
 
                 resolved_token = resolve_bot_token_from_env_or_config(bot_cfg.telegram.bot_token)
+                if resolved_token:
+                    sanitizer.register_secret(resolved_token)
                 use_bot_api = bot_cfg.telegram.mode == "bot_api" or (
                     bot_cfg.telegram.mode == "auto" and bool(resolved_token)
                 )
@@ -463,13 +625,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                         typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
                         typing_max_seconds=bot_cfg.behavior.typing_max_seconds,
+                        sanitizer=sanitizer,
                     )
                 else:
                     tg_client = TelegramUserbot(
-                        session_path=bot_cfg.telegram.session_path,
-                        api_id=bot_cfg.telegram.api_id,
-                        api_hash=bot_cfg.telegram.api_hash,
+                        session_path=bot_cfg.telegram.session_path or "data/session/userbot.session",
+                        api_id=bot_cfg.telegram.api_id or _parse_int_env("TELEGRAM_API_ID") or 0,
+                        api_hash=bot_cfg.telegram.api_hash or os.environ.get("TELEGRAM_API_HASH", ""),
                         allowed_chat_ids=target_all,
+                        allowed_dm_user_ids=GroupBotOrchestrator._effective_dm_user_ids(bot_cfg),
+                        ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
                         bot_names=bot_cfg.behavior.bot_names,
                         typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                         typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
@@ -481,7 +646,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             had_error = False
             try:
                 bot_name = (
-                    bot_cfg.behavior.bot_names[0] if bot_cfg.behavior.bot_names else "Джефф"
+                    bot_cfg.behavior.bot_names[0] if bot_cfg.behavior.bot_names else "Потужнич"
                 )
                 for job, slot_dt in selected_jobs:
                     if args.chat_id is not None:
@@ -512,13 +677,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         if not text:
                             had_error = True
                         elif not args.dry_run and tg_client is not None:
+                            safe_text = sanitizer.sanitize(text)
                             sent_res = await tg_client.send_reply(
                                 chat_id=cid,
-                                text=text,
+                                text=safe_text,
                                 reply_to_msg_id=None,
                                 simulate_typing=bool(bot_cfg.behavior.typing_simulation),
                             )
                             sent = True
+                            text = safe_text
                             sent_msg_id = GroupBotOrchestrator._extract_sent_message_id(sent_res)
                             await store.save_message(
                                 ChatMessage(
@@ -553,6 +720,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return (1 if had_error else 0), {
                 "status": status,
                 "dry_run": bool(args.dry_run),
+                "sent": any(bool(r.get("sent")) for r in results),
                 "results": results,
             }
 

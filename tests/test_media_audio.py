@@ -22,16 +22,30 @@ from bot.media.audio import (
 
 
 def test_resolve_ffmpeg_path():
-    # 1. Default static resolution
+    # 1. Default resolution
     path = resolve_ffmpeg_path()
     assert os.path.exists(path)
     assert os.access(path, os.X_OK)
 
     # 2. Custom path resolution
     custom_path = resolve_ffmpeg_path(path)
-    assert custom_path == path
+    assert custom_path == str(Path(path).resolve())
 
-    # 3. Nonexistent path with mock fallback failure
+    # 3. Invalid custom path falls back to system /usr/local/bin/ffmpeg when which() is None
+    def _fake_isfile(p: str) -> bool:
+        return p == "/usr/local/bin/ffmpeg"
+
+    def _fake_access(p: object, mode: int) -> bool:
+        return str(p) == "/usr/local/bin/ffmpeg"
+
+    with (
+        patch("os.path.isfile", side_effect=_fake_isfile),
+        patch("os.access", side_effect=_fake_access),
+        patch("shutil.which", return_value=None),
+    ):
+        assert resolve_ffmpeg_path(custom_path="/nonexistent/ffmpeg") == "/usr/local/bin/ffmpeg"
+
+    # 4. Nonexistent path with all fallbacks missing -> FileNotFoundError
     with patch("os.path.isfile", return_value=False), patch("shutil.which", return_value=None):
         with pytest.raises(FileNotFoundError, match="FFmpeg binary not found"):
             resolve_ffmpeg_path(custom_path="/nonexistent/ffmpeg")

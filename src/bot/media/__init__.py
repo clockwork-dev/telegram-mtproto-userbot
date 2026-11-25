@@ -16,6 +16,20 @@ from bot.media.documents import (
     extract_pdf_text,
     extract_plain_text,
 )
+from bot.media.image_gen import (
+    ALLOWED_ASPECT_RATIOS,
+    IMAGE_INTENT_RE,
+    ImageCommandParseResult,
+    ImageGenerationLimiter,
+    ImageRateLimitError,
+    ImageRequestSpec,
+    ValidatedImageInfo,
+    extract_image_specs,
+    normalize_aspect_ratio,
+    parse_imagine_command,
+    should_send_as_document,
+    validate_image_bytes,
+)
 from bot.media.processor import MediaProcessor, ProcessedMedia
 from bot.media.stt import (
     STTDurationError,
@@ -30,13 +44,17 @@ from bot.media.stt import (
     probe_wav_duration,
 )
 from bot.media.tts import (
+    RECOMMENDED_GEMINI_FEMALE_VOICES,
+    RECOMMENDED_GEMINI_MALE_VOICES,
     TTSError,
     TTSResult,
     TTSSkippedError,
     TTSSynthesizer,
     detect_speech_language,
+    extract_tts_mood_and_text,
     probe_audio_duration,
     sanitize_text_for_tts,
+    strip_tts_emotion_tags,
     transcode_to_telegram_voice,
 )
 
@@ -65,12 +83,28 @@ __all__ = [
     "is_stt_available",
     "load_wav_audio",
     "probe_wav_duration",
+    "RECOMMENDED_GEMINI_MALE_VOICES",
+    "RECOMMENDED_GEMINI_FEMALE_VOICES",
     "TTSError",
     "TTSSkippedError",
     "TTSResult",
     "TTSSynthesizer",
     "detect_speech_language",
+    "extract_tts_mood_and_text",
     "sanitize_text_for_tts",
+    "strip_tts_emotion_tags",
     "transcode_to_telegram_voice",
     "probe_audio_duration",
+    "ALLOWED_ASPECT_RATIOS",
+    "IMAGE_INTENT_RE",
+    "ImageCommandParseResult",
+    "ImageGenerationLimiter",
+    "ImageRateLimitError",
+    "ImageRequestSpec",
+    "ValidatedImageInfo",
+    "extract_image_specs",
+    "normalize_aspect_ratio",
+    "parse_imagine_command",
+    "should_send_as_document",
+    "validate_image_bytes",
 ]

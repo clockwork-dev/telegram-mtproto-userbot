@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,31 @@ _OAUTH_TOKEN_FILENAMES: tuple[str, ...] = (
     "jetski-standalone-oauth-token",
     "antigravity-oauth-token",
 )
+
+# Subdirectories inside <data_dir>/.gemini/antigravity-cli eligible for old-session cleanup
+_CLEANUP_TARGET_SUBDIRS: tuple[str, ...] = (
+    "conversations",
+    "brain",
+    "implicit",
+    "presence",
+    "log",
+)
+
+# Explicit deny-list of protected entries inside gemini_dir that must NEVER be deleted
+_PROTECTED_GEMINI_ENTRIES: frozenset[str] = frozenset({
+    *_OAUTH_TOKEN_FILENAMES,
+    "installation_id",
+    "settings.json",
+    "builtin",
+    "bin",
+    "annotations",
+    "jetski_state.pbtxt",
+    "SOUL.md",
+    "conversation_summaries.db",
+    "conversation_summaries.db-wal",
+    "conversation_summaries.db-shm",
+    "jetbox_summaries_proto.pb",
+})
 
 # Keyring bypass marker: when SSH_CONNECTION is set, agy's Go CompositeTokenStorage
 # forces file-based token storage rather than reading/writing host OS keyrings.
@@ -738,3 +765,218 @@ def run_isolated_antigravity_login(
                 pass
 
     return res.returncode
+
+
+def _effective_entry_mtime(entry_path: Path, base_mtime: float, *, is_dir: bool) -> float:
+    """Return latest mtime across a directory entry and its immediate non-symlink children."""
+    latest = base_mtime
+    if not is_dir:
+        return latest
+    try:
+        with os.scandir(entry_path) as it:
+            for child in it:
+                try:
+                    if child.is_symlink():
+                        continue
+                    child_mtime = child.stat(follow_symlinks=False).st_mtime
+                    if child_mtime > latest:
+                        latest = child_mtime
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return latest
+
+
+def _matches_active_conversation(entry_name: str, active_ids: set[str]) -> bool:
+    """Return True if entry_name belongs to any active conversation ID."""
+    if not active_ids:
+        return False
+    for cid in active_ids:
+        if entry_name == cid or entry_name.startswith(f"{cid}."):
+            return True
+    return False
+
+
+def _safe_delete_confined_entry(entry_path: Path, allowed_subdir: Path) -> bool:
+    """Safely remove a file or directory strictly inside allowed_subdir without following symlinks."""
+    if entry_path.is_symlink():
+        return False
+    try:
+        resolved = entry_path.resolve(strict=True)
+    except OSError:
+        return False
+    try:
+        if not resolved.is_relative_to(allowed_subdir) or resolved == allowed_subdir:
+            return False
+    except ValueError:
+        return False
+
+    if resolved.is_file():
+        resolved.unlink()
+        return True
+
+    if resolved.is_dir():
+        for root_str, dirnames, filenames in os.walk(resolved, topdown=False, followlinks=False):
+            root_path = Path(root_str)
+            for fname in filenames:
+                fp = root_path / fname
+                if fp.is_symlink():
+                    continue
+                try:
+                    fp_resolved = fp.resolve(strict=True)
+                    if not fp_resolved.is_relative_to(allowed_subdir):
+                        continue
+                    fp_resolved.unlink()
+                except (OSError, ValueError):
+                    continue
+            for dname in dirnames:
+                dp = root_path / dname
+                if dp.is_symlink():
+                    continue
+                try:
+                    dp_resolved = dp.resolve(strict=True)
+                    if not dp_resolved.is_relative_to(allowed_subdir) or dp_resolved == allowed_subdir:
+                        continue
+                    dp_resolved.rmdir()
+                except (OSError, ValueError):
+                    continue
+        try:
+            resolved.rmdir()
+            return True
+        except OSError:
+            return not resolved.exists()
+
+    return False
+
+
+def cleanup_old_antigravity_sessions(
+    data_dir: Path | str,
+    *,
+    max_age_seconds: float = 24.0 * 3600.0,
+    max_entries_per_dir: int = 30,
+    min_fresh_age_seconds: float = 3600.0,
+    active_conversation_ids: Collection[str] | None = None,
+    now: float | None = None,
+) -> dict[str, int]:
+    """Safely prune stale oneshot agy session artifacts inside `<data_dir>/.gemini/antigravity-cli`.
+
+    Deletes ONLY entries strictly inside the allowlisted session subdirectories
+    (`conversations/`, `brain/`, `implicit/`, `presence/`, `log/`) that are older than
+    `max_age_seconds` (default 24h) or beyond `max_entries_per_dir` (default 30 newest).
+
+    Hard safety invariants:
+    - Never touches top-level files/dirs in `gemini_dir` (OAuth tokens, `installation_id`,
+      `settings.json`, `builtin/`, `bin/`, `annotations/`, `jetski_state.pbtxt`, `cli.log`, etc.).
+    - Never deletes fresh entries (`age < min_fresh_age_seconds`, default 1h), even when over limit.
+    - Never deletes entries matching `active_conversation_ids`.
+    - Never follows symlinks and never operates outside `<data_dir>/.gemini/antigravity-cli`.
+    """
+    stats = {"removed": 0, "skipped_protected": 0, "errors": 0}
+
+    try:
+        isolated_home = Path(data_dir).expanduser().resolve()
+    except OSError:
+        return stats
+
+    gemini_root = isolated_home / ".gemini"
+    gemini_dir = gemini_root / "antigravity-cli"
+
+    if gemini_root.is_symlink() or gemini_dir.is_symlink() or not gemini_dir.is_dir():
+        return stats
+
+    try:
+        resolved_gemini_dir = gemini_dir.resolve(strict=True)
+        if not resolved_gemini_dir.is_relative_to(isolated_home):
+            return stats
+        if resolved_gemini_dir.name != "antigravity-cli" or resolved_gemini_dir.parent.name != ".gemini":
+            return stats
+    except (OSError, ValueError):
+        return stats
+
+    now_ts = time.time() if now is None else float(now)
+    min_fresh = max(0.0, float(min_fresh_age_seconds))
+    max_age = max(min_fresh, float(max_age_seconds))
+    keep_limit = max(0, int(max_entries_per_dir))
+    active_ids = {
+        str(cid).strip()
+        for cid in (active_conversation_ids or ())
+        if isinstance(cid, str) and cid.strip()
+    }
+
+    for subdir_name in _CLEANUP_TARGET_SUBDIRS:
+        if subdir_name in _PROTECTED_GEMINI_ENTRIES:
+            continue
+        subdir = resolved_gemini_dir / subdir_name
+        if subdir.is_symlink() or not subdir.is_dir():
+            continue
+        try:
+            resolved_subdir = subdir.resolve(strict=True)
+            if not resolved_subdir.is_relative_to(resolved_gemini_dir) or resolved_subdir == resolved_gemini_dir:
+                continue
+        except (OSError, ValueError):
+            continue
+
+        candidates: list[tuple[float, float, Path, bool]] = []
+        try:
+            with os.scandir(resolved_subdir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            stats["skipped_protected"] += 1
+                            continue
+                        if entry.name in _PROTECTED_GEMINI_ENTRIES:
+                            stats["skipped_protected"] += 1
+                            continue
+                        entry_path = Path(entry.path)
+                        resolved_entry = entry_path.resolve(strict=True)
+                        if (
+                            not resolved_entry.is_relative_to(resolved_subdir)
+                            or resolved_entry == resolved_subdir
+                        ):
+                            stats["skipped_protected"] += 1
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        eff_mtime = _effective_entry_mtime(
+                            entry_path,
+                            st.st_mtime,
+                            is_dir=entry.is_dir(follow_symlinks=False),
+                        )
+                        age = now_ts - eff_mtime
+                        is_protected = (
+                            age < min_fresh
+                            or _matches_active_conversation(entry.name, active_ids)
+                        )
+                        candidates.append((eff_mtime, age, entry_path, is_protected))
+                    except (OSError, ValueError):
+                        stats["errors"] += 1
+                        continue
+        except OSError:
+            stats["errors"] += 1
+            continue
+
+        # Sort newest first so the most recent `keep_limit` entries are retained
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        for rank, (_eff_mtime, age, entry_path, is_protected) in enumerate(candidates):
+            if is_protected:
+                stats["skipped_protected"] += 1
+                continue
+            if age > max_age or rank >= keep_limit:
+                try:
+                    if _safe_delete_confined_entry(entry_path, resolved_subdir):
+                        stats["removed"] += 1
+                    else:
+                        stats["skipped_protected"] += 1
+                except OSError:
+                    stats["errors"] += 1
+
+    if stats["removed"] > 0:
+        logger.debug(
+            "Antigravity session cleanup in %s removed=%d protected=%d errors=%d",
+            resolved_gemini_dir,
+            stats["removed"],
+            stats["skipped_protected"],
+            stats["errors"],
+        )
+    return stats

@@ -685,3 +685,177 @@ async def test_telegram_desktop_json_importer(tmp_path):
 
     await store.close()
 
+
+@pytest.mark.asyncio
+async def test_legacy_6_column_schema_migration_and_lifecycle_crud(tmp_path):
+    """Verify legacy 6-column memory_facts migration, FTS5 sync, and embedding invalidation."""
+    import sqlite3
+
+    import numpy as np
+
+    from bot.memory.embeddings import vector_to_bytes
+
+    db_file = tmp_path / "legacy_memory.sqlite"
+    raw_conn = sqlite3.connect(str(db_file))
+    raw_conn.execute(
+        """
+        CREATE TABLE memory_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            category TEXT NOT NULL,
+            source_chat_id INTEGER,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    raw_conn.execute(
+        "INSERT INTO memory_facts (subject, fact, category, source_chat_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("Женя", "Купил красную электрогитару Fender", "friend_bio", -100111, 1700000100),
+    )
+    raw_conn.execute(
+        "INSERT INTO memory_facts (subject, fact, category, source_chat_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("Аліна", "Планирует поездку во Львов на выходные", "event", -100111, 1700000200),
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    store = MemoryStore(db_path=str(db_file))
+    await store.init_db()
+    # Second init_db must be completely idempotent
+    await store.init_db()
+
+    conn = store._get_connection()
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(memory_facts)").fetchall()}
+    assert {
+        "id",
+        "subject",
+        "fact",
+        "category",
+        "source_chat_id",
+        "created_at",
+        "subject_user_id",
+        "status",
+        "updated_at",
+        "expires_at",
+        "superseded_by",
+    } <= cols
+
+    by_id = await store.get_facts_by_ids([1, 2])
+    assert by_id[1].status == "active"
+    assert by_id[1].updated_at == 1700000100
+    assert by_id[2].status == "active"
+    assert by_id[2].updated_at == 1700000200
+
+    # FTS5 search works on pre-existing legacy rows rebuilt during init_schema
+    legacy_hits = await store.search_facts("электрогитара", chat_id=-100111)
+    assert [h.id for h in legacy_hits] == [1]
+
+    vec_blob = vector_to_bytes(np.ones(64, dtype=np.float32))
+    await store.upsert_fact_embedding(1, "gemini-embedding-001", 64, vec_blob, updated_at=1700000300)
+    await store.upsert_fact_embedding(2, "gemini-embedding-001", 64, vec_blob, updated_at=1700000300)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM memory_fact_embeddings WHERE fact_id IN (1, 2)").fetchone()[0]
+        == 2
+    )
+
+    # update_fact updates FTS5 and invalidates stale embedding when text changes
+    ok_upd = await store.update_fact(
+        1,
+        fact="Продал старую гитару и купил синтезатор Yamaha",
+        subject_user_id=380227601,
+        updated_at=1700000500,
+    )
+    assert ok_upd is True
+    assert await store.search_facts("электрогитара", chat_id=-100111) == []
+    synth_hits = await store.search_facts("синтезатор", chat_id=-100111)
+    assert [h.id for h in synth_hits] == [1]
+    assert synth_hits[0].subject_user_id == 380227601
+    assert (
+        conn.execute("SELECT COUNT(*) FROM memory_fact_embeddings WHERE fact_id = 1").fetchone()[0]
+        == 0
+    )
+
+    # supersede_fact hides superseded fact from search_facts and deletes its embedding
+    ok_sup = await store.supersede_fact(2, new_fact_id=1, status="superseded", updated_at=1700000600)
+    assert ok_sup is True
+    assert await store.search_facts("Львов", chat_id=-100111) == []
+    sup_rec = (await store.get_facts_by_ids([2]))[2]
+    assert sup_rec.status == "superseded"
+    assert sup_rec.superseded_by == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM memory_fact_embeddings WHERE fact_id = 2").fetchone()[0]
+        == 0
+    )
+
+    # DELETE trigger cleans memory_fact_embeddings even when foreign_keys = OFF
+    conn.execute("PRAGMA foreign_keys = OFF")
+    fid3 = await store.add_fact(
+        subject="Владос",
+        fact="Собрал кастомную механическую клавиатуру",
+        category="friend_bio",
+        source_chat_id=-100111,
+    )
+    await store.upsert_fact_embedding(fid3, "gemini-embedding-001", 64, vec_blob)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM memory_fact_embeddings WHERE fact_id = ?", (fid3,)).fetchone()[0]
+        == 1
+    )
+    await store.delete_fact(fid3)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM memory_fact_embeddings WHERE fact_id = ?", (fid3,)).fetchone()[0]
+        == 0
+    )
+
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_strict_chat_id_isolation_and_global_facts():
+    """Verify DM and group facts never leak across chat_ids while global facts remain shared."""
+    store = MemoryStore(db_path=":memory:")
+    await store.init_db()
+
+    dm_id = await store.add_fact(
+        subject="Родион",
+        fact="Личный секретный сервер стоит дома на балконе",
+        category="friend_bio",
+        source_chat_id=111,
+    )
+    group_a_id = await store.add_fact(
+        subject="Женя",
+        fact="Игровой сервер майнкрафт поднят в группе А",
+        category="lore",
+        source_chat_id=-100222,
+    )
+    group_b_id = await store.add_fact(
+        subject="Саша",
+        fact="Тестовый сервер аналитики крутится в группе Б",
+        category="lore",
+        source_chat_id=-100333,
+    )
+    global_id = await store.add_fact(
+        subject="Group",
+        fact="Общий резервный сервер мониторинга доступен всем",
+        category="lore",
+        source_chat_id=None,
+    )
+
+    hits_group_a = await store.search_facts("сервер", limit=10, chat_id=-100222)
+    assert {h.id for h in hits_group_a} == {group_a_id, global_id}
+
+    hits_dm = await store.search_facts("сервер", limit=10, chat_id=111)
+    assert {h.id for h in hits_dm} == {dm_id, global_id}
+
+    hits_group_b = await store.search_facts("сервер", limit=10, chat_id=-100333)
+    assert {h.id for h in hits_group_b} == {group_b_id, global_id}
+
+    # Backward-compatible unscoped search when chat_id=None
+    hits_unscoped = await store.search_facts("сервер", limit=10, chat_id=None)
+    assert {h.id for h in hits_unscoped} == {dm_id, group_a_id, group_b_id, global_id}
+
+    await store.close()
+
+

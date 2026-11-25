@@ -2,6 +2,7 @@
 
 from bot.core.models import (
     ChatMessage,
+    GeneratedImageResult,
     MediaAttachment,
     MessageRole,
     ProviderResponse,
@@ -10,6 +11,7 @@ from bot.core.models import (
 
 __all__ = [
     "ChatMessage",
+    "GeneratedImageResult",
     "MediaAttachment",
     "MessageRole",
     "ProviderResponse",

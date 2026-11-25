@@ -1,8 +1,9 @@
 """Classic Telegram Bot API Client (HTTPS Long-Polling + Media Download).
 
 Provides the exact same interface as TelegramUserbot (`start`, `stop`, `send_reply`,
-`send_reaction`, `register_message_handler`, `client.download_media`) using only a
-`@BotFather` token (`TELEGRAM_BOT_TOKEN`), without requiring `api_id` or `api_hash`.
+`send_photo`, `send_document`, `send_voice`, `send_reaction`, `register_message_handler`,
+`client.download_media`) using only a `@BotFather` token (`TELEGRAM_BOT_TOKEN`),
+without requiring `api_id` or `api_hash`.
 """
 
 from __future__ import annotations
@@ -20,11 +21,18 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
-from bot.telegram.client import calculate_typing_delay, validate_document_path
+from bot.telegram.client import (
+    MAX_DOCUMENT_SIZE_BYTES,
+    calculate_typing_delay,
+    validate_document_path,
+)
 from bot.telegram.handlers import IncomingMessage, MessageDispatcher
 from bot.telegram.heuristics import ReplyHeuristics
+
+if TYPE_CHECKING:
+    from bot.security.sanitizer import SecretSanitizer
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +90,58 @@ def normalize_reaction_emoji(emoji: str) -> str:
     if no_vs in _VALID_TELEGRAM_REACTIONS:
         return no_vs
     return "👍"
+
+
+_TELEGRAM_MAX_CAPTION_LEN = 1024
+
+_MIME_TO_IMAGE_EXT: Dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _truncate_telegram_caption(caption: Optional[str]) -> Optional[str]:
+    """Truncate caption to Telegram Bot API's 1024-character limit."""
+    if caption is None:
+        return None
+    if len(caption) > _TELEGRAM_MAX_CAPTION_LEN:
+        return caption[: _TELEGRAM_MAX_CAPTION_LEN - 3] + "..."
+    return caption
+
+
+def _infer_image_mime_and_ext(
+    data: bytes,
+    *,
+    mime_type: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> tuple[str, str]:
+    """Infer `(mime_type, extension)` for an image payload from explicit MIME, magic bytes, or filename."""
+    if mime_type and mime_type.strip():
+        norm = mime_type.strip().lower()
+        if norm == "image/jpg":
+            norm = "image/jpeg"
+        ext = _MIME_TO_IMAGE_EXT.get(norm)
+        if ext is not None:
+            return norm, ext
+        guessed_ext = mimetypes.guess_extension(norm) or ".jpg"
+        return norm, guessed_ext
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+
+    if filename:
+        guessed_mime = mimetypes.guess_type(filename)[0]
+        if guessed_mime:
+            norm = "image/jpeg" if guessed_mime == "image/jpg" else guessed_mime
+            return norm, _MIME_TO_IMAGE_EXT.get(norm, Path(filename).suffix or ".jpg")
+
+    return "image/jpeg", ".jpg"
 
 
 def _encode_multipart_form_data(
@@ -144,13 +204,19 @@ class BotAPIMessageEvent:
         self.id: int = int(msg_dict.get("message_id", 0))
         chat = msg_dict.get("chat") or {}
         self.chat_id: int = int(chat.get("id", 0))
+        self.chat_type: str = str(chat.get("type") or "").strip().lower()
+        self.is_private: bool = self.chat_type == "private"
+        self.date: Optional[int] = msg_dict.get("date")
 
         sender = msg_dict.get("from") or {}
         self.sender_id: int = int(sender.get("id", 0))
+        self.sender_is_bot: bool = bool(sender.get("is_bot", False))
         first = sender.get("first_name") or ""
         last = sender.get("last_name") or ""
         full_name = f"{first} {last}".strip()
-        username = sender.get("username") or ""
+        raw_username = sender.get("username")
+        username = raw_username.strip() if isinstance(raw_username, str) and raw_username.strip() else ""
+        self.sender_username: Optional[str] = username or None
         self.sender_name: str = full_name or (f"@{username}" if username else f"User_{self.sender_id}")
 
         self.out: bool = self.sender_id == bot_id
@@ -373,25 +439,45 @@ class TelegramBotAPIClient:
         self,
         bot_token: str,
         allowed_chat_ids: Optional[List[int]] = None,
+        allowed_dm_user_ids: Optional[List[int]] = None,
+        ignored_sender_usernames: Optional[List[str]] = None,
         bot_names: Optional[List[str]] = None,
         typing_cpm: int = 300,
         typing_min_seconds: float = 1.0,
         typing_max_seconds: float = 8.0,
         backlog_Callback: Optional[Callable[[IncomingMessage], Awaitable[None]]] = None,
+        backlog_callback: Optional[Callable[[IncomingMessage], Awaitable[None]]] = None,
+        sanitizer: Optional["SecretSanitizer"] = None,
     ) -> None:
         self.bot_token = bot_token.strip()
         if not self.bot_token:
             raise ValueError("Telegram bot_token cannot be empty.")
 
+        self._sanitizer = sanitizer
+        if self._sanitizer is not None:
+            self._sanitizer.register_secret(self.bot_token)
+
         self.allowed_chat_ids: List[int] = (
             [int(cid) for cid in allowed_chat_ids] if allowed_chat_ids is not None else []
         )
         self._allowed_chat_ids_set = set(self.allowed_chat_ids)
+        self.allowed_dm_user_ids: List[int] = (
+            [int(uid) for uid in allowed_dm_user_ids] if allowed_dm_user_ids is not None else []
+        )
+        self._allowed_dm_user_ids_set = set(self.allowed_dm_user_ids)
+        self.ignored_sender_usernames: List[str] = (
+            list(ignored_sender_usernames)
+            if ignored_sender_usernames is not None
+            else ["hermes_kuk7yi6kfm3lcdfa_bot"]
+        )
+        self._ignored_sender_usernames_set = {
+            u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
+        }
         self.bot_names: List[str] = list(bot_names) if bot_names is not None else []
         self.typing_cpm = typing_cpm
         self.typing_min_seconds = typing_min_seconds
         self.typing_max_seconds = typing_max_seconds
-        self.backlog_callback = backlog_Callback
+        self.backlog_callback = backlog_Callback or backlog_callback
 
         self.bot_id: int = 0
         self.bot_username: Optional[str] = None
@@ -403,6 +489,44 @@ class TelegramBotAPIClient:
         self._polling_task: Optional[asyncio.Task] = None
         self._offset: int = 0
         self._heuristics = ReplyHeuristics()
+
+    def sync_access_lists(
+        self,
+        *,
+        allowed_chat_ids: Optional[List[int]] = None,
+        allowed_dm_user_ids: Optional[List[int]] = None,
+        ignored_sender_usernames: Optional[List[str]] = None,
+        bot_names: Optional[List[str]] = None,
+    ) -> None:
+        """Synchronize group/DM allowlists, ignored usernames, and bot aliases."""
+        if allowed_chat_ids is not None:
+            self.allowed_chat_ids = [int(cid) for cid in allowed_chat_ids]
+            self._allowed_chat_ids_set = set(self.allowed_chat_ids)
+        if allowed_dm_user_ids is not None:
+            self.allowed_dm_user_ids = [int(uid) for uid in allowed_dm_user_ids]
+            self._allowed_dm_user_ids_set = set(self.allowed_dm_user_ids)
+        if ignored_sender_usernames is not None:
+            self.ignored_sender_usernames = list(ignored_sender_usernames)
+            self._ignored_sender_usernames_set = {
+                u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
+            }
+        if bot_names is not None:
+            updated_names = list(bot_names)
+            if self.bot_first_name and self.bot_first_name not in updated_names:
+                updated_names.append(self.bot_first_name)
+            self.bot_names = updated_names
+
+    def _redact_secrets(self, value: Any) -> str:
+        text = "" if value is None else str(value)
+        if self._sanitizer is not None:
+            text = self._sanitizer.sanitize(text)
+        if self.bot_token and self.bot_token in text:
+            text = text.replace(self.bot_token, "[REDACTED]")
+        if self.bot_token:
+            quoted_tok = urllib.parse.quote(self.bot_token, safe="")
+            if quoted_tok and quoted_tok in text:
+                text = text.replace(quoted_tok, "[REDACTED]")
+        return text
 
     def _api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.bot_token}/{method}"
@@ -426,8 +550,9 @@ class TelegramBotAPIClient:
                     raw = resp.read().decode("utf-8")
                     parsed = json.loads(raw)
                     if not parsed.get("ok"):
+                        desc = self._redact_secrets(parsed.get("description"))
                         raise RuntimeError(
-                            f"Telegram Bot API {method} failed: {parsed.get('description')}"
+                            f"Telegram Bot API {method} failed: {desc}"
                         )
                     return parsed
             except urllib.error.HTTPError as exc:
@@ -436,18 +561,22 @@ class TelegramBotAPIClient:
                     err_body = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     pass
+                safe_err = self._redact_secrets(err_body)
                 raise RuntimeError(
-                    f"Telegram Bot API HTTP {exc.code} on {method}: {err_body}"
-                ) from exc
+                    f"Telegram Bot API HTTP {exc.code} on {method}: {safe_err}"
+                ) from None
             except (ConnectionResetError, urllib.error.URLError, TimeoutError) as exc:
+                safe_exc = self._redact_secrets(exc)
                 if attempt >= max_attempts:
-                    raise
+                    raise RuntimeError(
+                        f"Telegram Bot API network error on {method}: {safe_exc}"
+                    ) from None
                 logger.warning(
                     "Transient network error on Bot API %s (attempt %d/%d): %s. Retrying in 0.2s...",
                     method,
                     attempt,
                     max_attempts,
-                    exc,
+                    safe_exc,
                 )
                 time.sleep(0.2)
         raise RuntimeError(f"Telegram Bot API {method} exhausted retries.")
@@ -468,14 +597,24 @@ class TelegramBotAPIClient:
     def _sync_send_document(
         self,
         chat_id: int,
-        file_path: Path,
+        file_path: Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         filename: Optional[str] = None,
         timeout: float = 120.0,
+        *,
+        mime_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        effective_filename = Path(filename).name if filename else file_path.name
-        file_bytes = file_path.read_bytes()
+        if isinstance(file_path, (bytes, bytearray)):
+            file_bytes = bytes(file_path)
+            if filename:
+                effective_filename = Path(filename).name
+            else:
+                _, ext = _infer_image_mime_and_ext(file_bytes, mime_type=mime_type)
+                effective_filename = f"generated{ext}" if mime_type or ext else "document"
+        else:
+            effective_filename = Path(filename).name if filename else file_path.name
+            file_bytes = file_path.read_bytes()
 
         fields: Dict[str, str] = {"chat_id": str(int(chat_id))}
         if caption:
@@ -488,6 +627,7 @@ class TelegramBotAPIClient:
             file_field="document",
             filename=effective_filename,
             file_bytes=file_bytes,
+            mime_type=mime_type,
         )
         headers = {
             "Accept": "application/json",
@@ -496,16 +636,67 @@ class TelegramBotAPIClient:
         }
         return self._sync_execute_request("sendDocument", body, headers, timeout=timeout)
 
+    def _sync_send_photo(
+        self,
+        chat_id: int,
+        photo_bytes: bytes,
+        *,
+        filename: str = "generated.jpg",
+        mime_type: str = "image/jpeg",
+        caption: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        parse_mode: Optional[str] = None,
+        disable_notification: bool = False,
+        timeout: float = 90.0,
+    ) -> Dict[str, Any]:
+        fields: Dict[str, str] = {"chat_id": str(int(chat_id))}
+        if caption:
+            fields["caption"] = caption
+        if reply_to_message_id is not None:
+            fields["reply_parameters"] = json.dumps(
+                {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                },
+                ensure_ascii=False,
+            )
+        if parse_mode:
+            fields["parse_mode"] = parse_mode
+        if disable_notification:
+            fields["disable_notification"] = "true"
+
+        body, content_type = _encode_multipart_form_data(
+            fields=fields,
+            file_field="photo",
+            filename=filename,
+            file_bytes=photo_bytes,
+            mime_type=mime_type,
+        )
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+        }
+        return self._sync_execute_request("sendPhoto", body, headers, timeout=timeout)
+
     def _sync_send_voice(
         self,
         chat_id: int,
-        voice_path: Path,
+        voice_source: Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         duration: Optional[int | float] = None,
         timeout: float = 60.0,
+        *,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        file_bytes = voice_path.read_bytes()
+        if isinstance(voice_source, (bytes, bytearray)):
+            file_bytes = bytes(voice_source)
+            effective_filename = Path(filename or "voice.ogg").name or "voice.ogg"
+        else:
+            file_bytes = voice_source.read_bytes()
+            effective_filename = Path(filename).name if filename else (voice_source.name or "voice.ogg")
 
         fields: Dict[str, str] = {"chat_id": str(int(chat_id))}
         if caption:
@@ -518,9 +709,9 @@ class TelegramBotAPIClient:
         body, content_type = _encode_multipart_form_data(
             fields=fields,
             file_field="voice",
-            filename=voice_path.name or "voice.ogg",
+            filename=effective_filename,
             file_bytes=file_bytes,
-            mime_type="audio/ogg",
+            mime_type=mime_type or "audio/ogg",
         )
         headers = {
             "Accept": "application/json",
@@ -545,8 +736,13 @@ class TelegramBotAPIClient:
             raise RuntimeError("Telegram getFile response did not contain file_path.")
         url = self._file_url(remote_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(url, timeout=60.0) as resp, open(dest, "wb") as out_f:
-            out_f.write(resp.read())
+        try:
+            with urllib.request.urlopen(url, timeout=60.0) as resp, open(dest, "wb") as out_f:
+                out_f.write(resp.read())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed downloading Telegram file: {self._redact_secrets(exc)}"
+            ) from None
         return dest.resolve()
 
     async def download_file_by_id(self, file_id: str, dest: Path) -> Path:
@@ -564,10 +760,27 @@ class TelegramBotAPIClient:
 
     def _convert_msg_dict(self, msg_dict: Dict[str, Any]) -> Optional[IncomingMessage]:
         ev = BotAPIMessageEvent(msg_dict, bot_id=self.bot_id)
-        if self._allowed_chat_ids_set and ev.chat_id not in self._allowed_chat_ids_set:
+        if ev.sender_is_bot:
+            return None
+        if ev.sender_username and ev.sender_username.lower().lstrip("@") in self._ignored_sender_usernames_set:
             return None
         if ev.out or ev.sender_id == self.bot_id:
             return None
+
+        if ev.is_private:
+            if not self._allowed_dm_user_ids_set:
+                return None
+            if (
+                ev.sender_id not in self._allowed_dm_user_ids_set
+                and ev.chat_id not in self._allowed_dm_user_ids_set
+            ):
+                return None
+        else:
+            if self._allowed_chat_ids_set:
+                if ev.chat_id not in self._allowed_chat_ids_set:
+                    return None
+            elif self._allowed_dm_user_ids_set:
+                return None
 
         is_mention = self._heuristics.is_mention(
             text=ev.raw_text,
@@ -583,6 +796,7 @@ class TelegramBotAPIClient:
             sender_name=ev.sender_name,
             text=ev.raw_text,
             reply_to_msg_id=ev.reply_to_msg_id,
+            reply_to_sender_id=ev.reply_to_sender_id,
             is_reply=ev.is_reply,
             is_mention=is_mention,
             raw_event=ev,
@@ -590,6 +804,9 @@ class TelegramBotAPIClient:
             reply_to_text=ev.reply_to_text,
             reply_to_author=ev.reply_to_author,
             reply_to_media_event=ev.reply_to_media_event,
+            is_private=ev.is_private,
+            sender_is_bot=ev.sender_is_bot,
+            sender_username=ev.sender_username,
         )
 
     async def start(self) -> None:
@@ -626,11 +843,14 @@ class TelegramBotAPIClient:
                         try:
                             await self.backlog_callback(inc)
                         except Exception as exc:
-                            logger.debug("Backlog seed error: %s", exc)
+                            logger.debug("Backlog seed error: %s", self._redact_secrets(exc))
             if updates:
                 logger.info("Processed %d historical updates (offset=%d)", len(updates), self._offset)
         except Exception as exc:
-            logger.warning("Initial getUpdates check failed (will retry in loop): %s", exc)
+            logger.warning(
+                "Initial getUpdates check failed (will retry in loop): %s",
+                self._redact_secrets(exc),
+            )
 
         if self._polling_task is None or self._polling_task.done():
             self._polling_task = asyncio.create_task(self._poll_loop())
@@ -661,7 +881,10 @@ class TelegramBotAPIClient:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("Telegram Bot API polling error: %s. Retrying in 3s...", exc)
+                logger.warning(
+                    "Telegram Bot API polling error: %s. Retrying in 3s...",
+                    self._redact_secrets(exc),
+                )
                 await asyncio.sleep(3.0)
 
     async def stop(self) -> None:
@@ -677,7 +900,7 @@ class TelegramBotAPIClient:
         logger.info("Telegram Bot API client stopped.")
 
     async def send_typing_action(self, chat_id: int, action: str = "typing") -> None:
-        """Immediately trigger chat action (typing, record_voice, etc.) without sleeping."""
+        """Immediately trigger chat action (typing, record_voice, upload_photo, etc.) without sleeping."""
         act_map = {
             "record-voice": "record_voice",
             "record-audio": "record_voice",
@@ -694,7 +917,7 @@ class TelegramBotAPIClient:
             "choose-sticker": "choose_sticker",
             "sticker": "choose_sticker",
         }
-        api_action = act_map.get(action.lower(), action)
+        api_action = act_map.get((action or "typing").lower(), action)
         try:
             await self.call_api(
                 "sendChatAction",
@@ -702,7 +925,11 @@ class TelegramBotAPIClient:
                 timeout=5.0,
             )
         except Exception as exc:
-            logger.debug("sendChatAction %s failed (non-critical): %s", api_action, exc)
+            logger.debug(
+                "sendChatAction %s failed (non-critical): %s",
+                api_action,
+                self._redact_secrets(exc),
+            )
 
     async def send_read_acknowledge(self, chat_id: int, max_id: Optional[int] = None) -> None:
         """Read acknowledge stub for Telegram Bot API parity (Bot API does not support read receipts)."""
@@ -726,7 +953,11 @@ class TelegramBotAPIClient:
             )
             await asyncio.sleep(delay)
         except Exception as exc:
-            logger.debug("sendChatAction %s failed (non-critical): %s", action, exc)
+            logger.debug(
+                "sendChatAction %s failed (non-critical): %s",
+                action,
+                self._redact_secrets(exc),
+            )
 
     async def send_reply(
         self,
@@ -736,12 +967,13 @@ class TelegramBotAPIClient:
         simulate_typing: bool = True,
     ) -> Any:
         """Send typing action, wait natural delay, and send message (optionally quoting)."""
+        safe_text = self._redact_secrets(text)
         if simulate_typing:
-            await self._simulate_chat_action(chat_id, "typing", text)
+            await self._simulate_chat_action(chat_id, "typing", safe_text)
 
         payload: Dict[str, Any] = {
             "chat_id": int(chat_id),
-            "text": text,
+            "text": safe_text,
         }
         if reply_to_msg_id is not None:
             payload["reply_parameters"] = {
@@ -754,53 +986,183 @@ class TelegramBotAPIClient:
     async def send_document(
         self,
         chat_id: int,
-        file_path: str | Path,
+        file_path: str | Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         simulate_typing: bool = True,
         filename: Optional[str] = None,
         timeout: float = 120.0,
+        *,
+        mime_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Validate file and upload a document via Bot API `POST /sendDocument`."""
-        validated_path = validate_document_path(file_path)
+        """Validate file or raw bytes and upload a document via Bot API `POST /sendDocument`."""
+        payload_source: Path | bytes
+        resolved_filename = filename
+        resolved_mime = mime_type
+        if isinstance(file_path, (bytes, bytearray)):
+            raw_bytes = bytes(file_path)
+            if not raw_bytes:
+                raise ValueError("Document bytes cannot be empty.")
+            if len(raw_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"Document size ({len(raw_bytes)} bytes) exceeds maximum allowed "
+                    f"({MAX_DOCUMENT_SIZE_BYTES} bytes)."
+                )
+            payload_source = raw_bytes
+            if not resolved_filename:
+                inferred_mime, ext = _infer_image_mime_and_ext(raw_bytes, mime_type=mime_type)
+                resolved_filename = f"generated{ext}"
+                if resolved_mime is None:
+                    resolved_mime = inferred_mime
+        else:
+            payload_source = validate_document_path(file_path)
+
+        effective_reply_id = (
+            reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+        )
+        safe_caption = (
+            _truncate_telegram_caption(self._redact_secrets(caption))
+            if caption is not None
+            else None
+        )
 
         if simulate_typing:
-            await self._simulate_chat_action(chat_id, "upload_document", caption or "")
+            await self._simulate_chat_action(chat_id, "upload_document", safe_caption or "")
 
         return await asyncio.to_thread(
             self._sync_send_document,
             chat_id,
-            validated_path,
-            caption,
-            reply_to_msg_id,
-            filename,
+            payload_source,
+            safe_caption,
+            effective_reply_id,
+            resolved_filename,
             timeout,
+            mime_type=resolved_mime,
         )
+
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: str | Path | bytes,
+        caption: str | None = None,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        reply_to_msg_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        simulate_typing: bool = False,
+        parse_mode: str | None = None,
+        disable_notification: bool = False,
+        timeout: float = 90.0,
+    ) -> int:
+        """Validate and upload a photo via Bot API `POST /sendPhoto`; returns sent message_id."""
+        if isinstance(photo, (bytes, bytearray)):
+            photo_bytes = bytes(photo)
+            if not photo_bytes:
+                raise ValueError("Photo bytes cannot be empty.")
+            if len(photo_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"Photo size ({len(photo_bytes)} bytes) exceeds maximum allowed "
+                    f"({MAX_DOCUMENT_SIZE_BYTES} bytes)."
+                )
+            resolved_mime, ext = _infer_image_mime_and_ext(
+                photo_bytes,
+                mime_type=mime_type,
+                filename=filename,
+            )
+            resolved_filename = Path(filename).name if filename else f"generated{ext}"
+        else:
+            validated_path = validate_document_path(photo)
+            photo_bytes = validated_path.read_bytes()
+            resolved_mime, ext = _infer_image_mime_and_ext(
+                photo_bytes,
+                mime_type=mime_type,
+                filename=filename or validated_path.name,
+            )
+            resolved_filename = (
+                Path(filename).name
+                if filename
+                else (validated_path.name or f"generated{ext}")
+            )
+
+        effective_reply_id = (
+            reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+        )
+        safe_caption = (
+            _truncate_telegram_caption(self._redact_secrets(caption))
+            if caption is not None
+            else None
+        )
+
+        if simulate_typing:
+            await self._simulate_chat_action(chat_id, "upload_photo", safe_caption or "")
+
+        resp = await asyncio.to_thread(
+            self._sync_send_photo,
+            chat_id,
+            photo_bytes,
+            filename=resolved_filename,
+            mime_type=resolved_mime,
+            caption=safe_caption,
+            reply_to_message_id=effective_reply_id,
+            parse_mode=parse_mode,
+            disable_notification=disable_notification,
+            timeout=timeout,
+        )
+        result = resp.get("result") if isinstance(resp, dict) else None
+        msg_id = result.get("message_id") if isinstance(result, dict) else None
+        if isinstance(msg_id, int) and not isinstance(msg_id, bool):
+            return msg_id
+        return 0
 
     async def send_voice(
         self,
         chat_id: int,
-        voice_path: str | Path,
+        voice_path: str | Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         duration: Optional[int | float] = None,
         simulate_typing: bool = True,
         timeout: float = 60.0,
+        *,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Validate file and upload a voice note via Bot API `POST /sendVoice`."""
-        validated_path = validate_document_path(voice_path)
+        """Validate file or raw bytes and upload a voice note via Bot API `POST /sendVoice`."""
+        payload_source: Path | bytes
+        if isinstance(voice_path, (bytes, bytearray)):
+            raw_bytes = bytes(voice_path)
+            if not raw_bytes:
+                raise ValueError("Voice bytes cannot be empty.")
+            if len(raw_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"Voice size ({len(raw_bytes)} bytes) exceeds maximum allowed "
+                    f"({MAX_DOCUMENT_SIZE_BYTES} bytes)."
+                )
+            payload_source = raw_bytes
+        else:
+            payload_source = validate_document_path(voice_path)
+
+        effective_reply_id = (
+            reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+        )
+        safe_caption = self._redact_secrets(caption) if caption is not None else None
 
         if simulate_typing:
-            await self._simulate_chat_action(chat_id, "record_voice", caption or "")
+            await self._simulate_chat_action(chat_id, "record_voice", safe_caption or "")
 
         return await asyncio.to_thread(
             self._sync_send_voice,
             chat_id,
-            validated_path,
-            caption,
-            reply_to_msg_id,
+            payload_source,
+            safe_caption,
+            effective_reply_id,
             duration,
             timeout,
+            filename=filename,
+            mime_type=mime_type,
         )
 
     async def send_reaction(
@@ -828,7 +1190,7 @@ class TelegramBotAPIClient:
                 emoji,
                 normalized_emoji,
                 msg_id,
-                exc,
+                self._redact_secrets(exc),
             )
             return False
 

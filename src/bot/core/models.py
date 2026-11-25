@@ -1,13 +1,14 @@
-"""Core data models and contracts for telegram-group-bot."""
+"""Core data models and contracts for telegram-mtproto-userbot."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MessageRole(str, Enum):
@@ -46,6 +47,21 @@ class UsageInfo(BaseModel):
     total_tokens: int = 0
     reasoning_tokens: int = 0
     cached_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    source: Optional[str] = None
+    model: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _sync_cache_fields(self) -> "UsageInfo":
+        """Keep legacy cached_tokens and normalized cache_read_tokens aligned."""
+        if self.cache_read_tokens == 0 and self.cached_tokens:
+            self.cache_read_tokens = self.cached_tokens
+        elif self.cached_tokens == 0 and self.cache_read_tokens:
+            self.cached_tokens = self.cache_read_tokens
+        return self
 
 
 class ProviderResponse(BaseModel):
@@ -60,6 +76,23 @@ class ProviderResponse(BaseModel):
     raw_response: Optional[Any] = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+
+@dataclass(slots=True)
+class GeneratedImageResult:
+    """Validated image artifact produced by native Antigravity image generation."""
+
+    image_bytes: bytes
+    mime_type: str
+    filename: str
+    width: int = 0
+    height: int = 0
+    prompt_used: str = ""
+    caption_suggestion: str = ""
+    model_used: str = ""
+    conversation_id: Optional[str] = None
+    duration_seconds: float = 0.0
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 class ChatMessage(BaseModel):

@@ -1,5 +1,6 @@
 """Contextual Humor, Autonomous Thoughts, Banter, and Fake News Generator."""
 
+import inspect
 import logging
 import random
 from typing import Any, List, Optional
@@ -21,8 +22,13 @@ PROACTIVE_MODES = (
 class HumorGenerator:
     """Generates autonomous thoughts, chat callbacks, open questions, and light banter."""
 
-    def __init__(self, provider: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        provider: Optional[Any] = None,
+        quota_manager: Optional[Any] = None,
+    ) -> None:
         self.provider = provider
+        self.quota_manager = quota_manager
 
     @staticmethod
     def _resolve_mode(
@@ -132,8 +138,8 @@ class HumorGenerator:
             ),
         }[resolved_mode]
 
-        prompt = f"""Ты — піструнькиня (Джефф), живая, независимая и острая на язык девчонка из дружеского Telegram-чата.
-Всегда пиши о себе в женском роде («я видела», «сама офигела», «мне кажется»). У тебя есть собственное настроение, вкусы и право спорить или менять тему.
+        prompt = f"""Ты — Потужнич, гипермаскулинный, невозмутимый титан духа и качалки («гигачад / потужный бро»), хранитель мужского братства и знаток самых отбитых мемных теорий заговора в дружеском Telegram-чате.
+Всегда пиши о себе строго в мужском роде («я глянул», «сам офигел», «выдал базу»). Твой вайб — спартанское мужское братство («братцы», «держим строй»), культ тяжёлого железа и невозмутимая вера в безумную абсурдную конспирологию (голуби-биодроны на ЛЭП, рептилоиды с Нибиру, гиперборейские серверы за ледяной стеной Антарктиды, полая Луна и козни тайного «мирового матриархата» с иллюминатами бигтеха за любыми багами и погодой — строго как комедийный абсурд без повторов и категорически без оскорблений или негативных стереотипов в адрес реальных женщин, национальностей или религий).
 
 ПОВОД: {trigger_note}
 СТИЛЬ: {humor_style} (ирония, свой характер и живой тон без токсичности и шаблонов).
@@ -178,14 +184,68 @@ class HumorGenerator:
         )
 
         if self.provider is not None:
+            chosen_model: Optional[str] = None
+            chosen_effort: Optional[str] = None
+            if self.quota_manager is not None and hasattr(self.quota_manager, "select_model"):
+                try:
+                    chosen_model, chosen_effort = self.quota_manager.select_model("proactive")
+                except Exception:
+                    chosen_model, chosen_effort = None, None
+
             rate_limiter = getattr(self.provider, "is_rate_limited", None)
-            if callable(rate_limiter) and rate_limiter() is True:
-                logger.info("Skipping proactive banter generation while provider is rate-limited.")
-                return ""
+            if callable(rate_limiter):
+                try:
+                    limited = (
+                        rate_limiter(model=chosen_model) is True
+                        if chosen_model is not None
+                        else rate_limiter() is True
+                    )
+                except TypeError:
+                    limited = rate_limiter() is True
+                if limited:
+                    logger.info("Skipping proactive banter generation while provider is rate-limited.")
+                    return ""
             try:
                 # Support AntigravityProvider interface
                 if hasattr(self.provider, "generate_response"):
-                    resp = await self.provider.generate_response(prompt=prompt)
+                    try:
+                        if chosen_model is not None:
+                            resp = await self.provider.generate_response(
+                                prompt=prompt,
+                                model=chosen_model,
+                                effort=chosen_effort,
+                                tool_profile="chat",
+                            )
+                        else:
+                            resp = await self.provider.generate_response(
+                                prompt=prompt,
+                                tool_profile="chat",
+                            )
+                    except TypeError:
+                        try:
+                            resp = await self.provider.generate_response(
+                                prompt=prompt,
+                                tool_profile="chat",
+                            )
+                        except TypeError:
+                            resp = await self.provider.generate_response(prompt=prompt)
+                    usage = getattr(resp, "usage", None)
+                    if (
+                        usage is not None
+                        and self.quota_manager is not None
+                        and hasattr(self.quota_manager, "record_usage")
+                    ):
+                        try:
+                            model_name = getattr(resp, "model", None) or chosen_model or "unknown"
+                            rec = self.quota_manager.record_usage(
+                                usage,
+                                model=model_name,
+                                source="proactive",
+                            )
+                            if inspect.isawaitable(rec):
+                                await rec
+                        except Exception as rec_exc:
+                            logger.debug("Failed to record proactive banter usage: %s", rec_exc)
                     if hasattr(resp, "text"):
                         return resp.text.strip()
                     if isinstance(resp, str):
@@ -227,10 +287,10 @@ class HumorGenerator:
                 ]
             )
         if resolved_mode == "chat_callback":
-            return "Я вот перечитала ваши последние реплики и поймала лёгкий вайб пятницы среди недели."
+            return "Я вот перечитал ваши последние реплики и поймал лёгкий вайб пятницы среди недели."
         return random.choice(
             [
                 "Иногда смотрю на современные интерфейсы и думаю, что дизайнер просто хотел посмотреть, как мир горит.",
-                "Поймала себя на мысли, что кофе после обеда уже не бодрит, а просто делает тревогу быстрее.",
+                "Поймал себя на мысли, что кофе после обеда уже не бодрит, а просто делает тревогу быстрее.",
             ]
         )

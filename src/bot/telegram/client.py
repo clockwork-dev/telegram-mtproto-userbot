@@ -2,13 +2,18 @@
 
 Features:
 - Session isolation with 0700 dir / 0600 file permissions
-- Allowed chat whitelisting
-- Self-message loop suppression
-- Natural reading and typing simulation with jitter
+- Allowed group and DM whitelisting + hot-reload sync_access_lists
+- Bot-sender and self-message loop suppression
+- Natural reading, typing, photo, document, and voice action simulation with jitter
+- Photo, document, and voice uploads supporting both file paths and raw bytes
 - Reply with quote and MTProto emoji reactions
 """
 
+from __future__ import annotations
+
 import asyncio
+import inspect
+import io
 import logging
 import os
 import random
@@ -19,6 +24,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SendReactionRequest, SetTypingRequest
 from telethon.tl.types import (
+    DocumentAttributeAudio,
     DocumentAttributeFilename,
     ReactionEmoji,
     SendMessageCancelAction,
@@ -114,6 +120,23 @@ def validate_document_path(
     return path.resolve()
 
 
+def _validate_media_bytes(
+    data: bytes | bytearray,
+    *,
+    kind: str,
+    max_size_bytes: int = MAX_DOCUMENT_SIZE_BYTES,
+) -> bytes:
+    """Validate that raw media bytes are non-empty and within size limits."""
+    raw = bytes(data)
+    if not raw:
+        raise ValueError(f"{kind} bytes cannot be empty.")
+    if len(raw) > max_size_bytes:
+        raise ValueError(
+            f"{kind} size ({len(raw)} bytes) exceeds maximum allowed ({max_size_bytes} bytes)."
+        )
+    return raw
+
+
 def calculate_typing_delay(
     text: str,
     cpm: int = 300,
@@ -165,7 +188,7 @@ class TelegramUserbot:
             else ["hermes_kuk7yi6kfm3lcdfa_bot"]
         )
         self._ignored_sender_usernames_set = {
-            u.lower().lstrip("@") for u in self.ignored_sender_usernames
+            u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
         }
         self.bot_names: List[str] = list(bot_names) if bot_names is not None else []
         self.typing_cpm = typing_cpm
@@ -243,7 +266,6 @@ class TelegramUserbot:
 
     async def start(self) -> None:
         """Connect MTProto client, ensure permissions, backfill history, and attach event listeners."""
-        # Ensure session parent directory permissions (0700)
         enforce_session_permissions(self.session_path)
 
         if not self.is_connected():
@@ -289,12 +311,42 @@ class TelegramUserbot:
         """Register an async callback for incoming messages."""
         self.dispatcher.register(handler)
 
+    def sync_access_lists(
+        self,
+        *,
+        allowed_chat_ids: Optional[List[int]] = None,
+        allowed_dm_user_ids: Optional[List[int]] = None,
+        ignored_sender_usernames: Optional[List[str]] = None,
+        bot_names: Optional[List[str]] = None,
+    ) -> None:
+        """Synchronize access control lists and bot aliases after config hot-reload."""
+        if allowed_chat_ids is not None:
+            self.allowed_chat_ids = [int(cid) for cid in allowed_chat_ids]
+            self._allowed_chat_ids_set = set(self.allowed_chat_ids)
+        if allowed_dm_user_ids is not None:
+            self.allowed_dm_user_ids = [int(uid) for uid in allowed_dm_user_ids]
+            self._allowed_dm_user_ids_set = set(self.allowed_dm_user_ids)
+        if ignored_sender_usernames is not None:
+            self.ignored_sender_usernames = list(ignored_sender_usernames)
+            self._ignored_sender_usernames_set = {
+                u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
+            }
+        if bot_names is not None:
+            self.bot_names = list(bot_names)
+        if self._bot_api_client is not None and hasattr(self._bot_api_client, "sync_access_lists"):
+            self._bot_api_client.sync_access_lists(
+                allowed_chat_ids=allowed_chat_ids,
+                allowed_dm_user_ids=allowed_dm_user_ids,
+                ignored_sender_usernames=ignored_sender_usernames,
+                bot_names=bot_names,
+            )
+
     async def _on_new_message(self, event: Any) -> None:
         """Internal Telethon event listener with chat whitelist and loop suppression."""
         # 1. Anti-loop guard: Drop bot senders and ignored usernames
         sender = getattr(event, "sender", None)
         raw_sender_is_bot = getattr(event, "sender_is_bot", False)
-        sender_is_bot = (raw_sender_is_bot is True)
+        sender_is_bot = raw_sender_is_bot is True
         if not sender_is_bot and sender is not None:
             sender_is_bot = (
                 getattr(sender, "bot", False) is True
@@ -335,7 +387,9 @@ class TelegramUserbot:
             is_priv = None
 
         if is_priv is None:
-            if self._allowed_dm_user_ids_set and (
+            if chat_id is not None and int(chat_id) < 0:
+                is_priv = False
+            elif self._allowed_dm_user_ids_set and (
                 (chat_id is not None and int(chat_id) in self._allowed_dm_user_ids_set)
                 or (sender_id is not None and int(sender_id) in self._allowed_dm_user_ids_set)
             ):
@@ -383,7 +437,7 @@ class TelegramUserbot:
         # 5. Dispatch to downstream business logic
         await self.dispatcher.dispatch(incoming)
 
-    async def _simulate_chat_action(self, chat_id: int, action: str, text: str) -> None:
+    async def _simulate_chat_action(self, chat_id: int, action: Any, text: str) -> None:
         """Simulate human-like reading/typing/upload delay using a Telethon chat action."""
         jitter = random.uniform(0.1, 0.6)
         delay = calculate_typing_delay(
@@ -393,14 +447,23 @@ class TelegramUserbot:
             max_seconds=self.typing_max_seconds,
             jitter=jitter,
         )
+        telethon_action: Any = action
+        if isinstance(action, str):
+            act_norm = action.strip().lower()
+            if act_norm in ("upload-photo", "upload_photo"):
+                telethon_action = SendMessageUploadPhotoAction(progress=0)
+            elif act_norm in ("upload-document", "upload_document"):
+                telethon_action = "document"
+            elif act_norm in ("record_voice", "record_audio"):
+                telethon_action = "record-voice"
         try:
-            async with self.client.action(chat_id, action):
+            async with self.client.action(chat_id, telethon_action):
                 await asyncio.sleep(delay)
         except Exception as e:
             logger.debug("Chat action '%s' simulation failed (non-critical): %s", action, e)
 
     async def send_typing_action(self, chat_id: int, action: str = "typing") -> None:
-        """Immediately trigger chat action (typing, record-voice, etc.) without sleeping."""
+        """Immediately trigger chat action (typing, upload-photo, record-voice, etc.) without sleeping."""
         if self._bot_api_client is not None and hasattr(self._bot_api_client, "send_typing_action"):
             try:
                 await self._bot_api_client.send_typing_action(chat_id, action=action)
@@ -410,7 +473,7 @@ class TelegramUserbot:
                 logger.debug("Bot API send_typing_action failed: %s", exc)
             return
 
-        act_lower = (action or "typing").lower()
+        act_lower = (action or "typing").strip().lower()
         if act_lower in ("record-voice", "record-audio", "record_voice", "record_audio", "voice"):
             action_obj = SendMessageRecordAudioAction()
         elif act_lower in ("upload-document", "upload_document", "document"):
@@ -423,17 +486,24 @@ class TelegramUserbot:
             action_obj = SendMessageTypingAction()
 
         try:
-            peer = chat_id
+            peer: Any = chat_id
             if callable(getattr(self.client, "get_input_entity", None)):
                 try:
-                    peer = await self.client.get_input_entity(chat_id)
+                    maybe_peer = self.client.get_input_entity(chat_id)
+                    peer = await maybe_peer if inspect.isawaitable(maybe_peer) else maybe_peer
                 except Exception as ent_err:
-                    logger.debug("get_input_entity for %s failed, using raw chat_id: %s", chat_id, ent_err)
+                    logger.debug(
+                        "get_input_entity for %s failed, using raw chat_id: %s",
+                        chat_id,
+                        ent_err,
+                    )
                     peer = chat_id
 
             req = SetTypingRequest(peer=peer, action=action_obj)
             if callable(self.client):
-                await self.client(req)
+                res = self.client(req)
+                if inspect.isawaitable(res):
+                    await res
         except FloodWaitError as fwe:
             logger.warning(
                 "FloodWaitError (%ds) in send_typing_action for chat %s",
@@ -481,29 +551,131 @@ class TelegramUserbot:
                 logger.warning("Network disconnect/timeout in send_reply for chat %s: %s", chat_id, net_err)
                 return None
 
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: bytes | str | Path,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        reply_to_msg_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+        simulate_typing: bool = True,
+        timeout: float = 120.0,
+    ) -> Any:
+        """Send a photo (from raw bytes or file path) via Bot API or Telethon."""
+        eff_reply_to = reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+
+        is_bytes = isinstance(photo, (bytes, bytearray))
+        raw_bytes = b""
+        safe_name = "image.png"
+        validated_path: Optional[Path] = None
+
+        if is_bytes:
+            raw_bytes = _validate_media_bytes(photo, kind="Photo")
+            safe_name = Path(filename or "image.png").name or "image.png"
+        else:
+            validated_path = validate_document_path(photo)
+
+        bot_api_client = getattr(self, "_bot_api_client", None)
+        if bot_api_client is not None:
+            return await bot_api_client.send_photo(
+                chat_id,
+                raw_bytes if is_bytes else validated_path,
+                caption=caption,
+                filename=filename,
+                mime_type=mime_type,
+                reply_to_message_id=eff_reply_to,
+                timeout=timeout,
+            )
+
+        if simulate_typing:
+            await self._simulate_chat_action(chat_id, "upload-photo", caption or "")
+
+        for attempt in range(2):
+            try:
+                if is_bytes:
+                    buf = io.BytesIO(raw_bytes)
+                    buf.name = safe_name
+                    file_obj: Any = buf
+                else:
+                    file_obj = str(validated_path)
+
+                coro = self.client.send_file(
+                    chat_id,
+                    file_obj,
+                    caption=caption,
+                    reply_to=eff_reply_to,
+                    force_document=False,
+                )
+                if timeout > 0:
+                    return await asyncio.wait_for(coro, timeout=timeout)
+                return await coro
+            except FloodWaitError as fwe:
+                wait_sec = getattr(fwe, "seconds", 0)
+                if attempt == 0 and 0 < wait_sec <= 10.0:
+                    logger.warning(
+                        "FloodWaitError (%ds) in send_photo for chat %s. Backing off...",
+                        wait_sec,
+                        chat_id,
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
+                logger.warning(
+                    "FloodWaitError (%ds) in send_photo for chat %s exceeds backoff limit or retry failed; skipping.",
+                    wait_sec,
+                    chat_id,
+                )
+                return None
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "Upload timed out in send_photo for chat %s (timeout=%s)",
+                    chat_id,
+                    timeout,
+                )
+                raise
+            except (ConnectionError, OSError) as net_err:
+                logger.warning("Network disconnect in send_photo for chat %s: %s", chat_id, net_err)
+                return None
+
     async def send_document(
         self,
         chat_id: int,
-        file_path: str | Path,
+        file_path: bytes | str | Path,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         simulate_typing: bool = True,
         filename: Optional[str] = None,
         timeout: float = 120.0,
+        mime_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Any:
-        """Send a document file to a chat via Bot API or Telethon after path/size validation."""
-        validated_path = validate_document_path(file_path)
+        """Send a document file or raw bytes via Bot API or Telethon after validation."""
+        eff_reply_to = reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+
+        is_bytes = isinstance(file_path, (bytes, bytearray))
+        raw_bytes = b""
+        safe_name = "attachment.bin"
+        validated_path: Optional[Path] = None
+
+        if is_bytes:
+            raw_bytes = _validate_media_bytes(file_path, kind="Document")
+            safe_name = Path(filename or "attachment.bin").name or "attachment.bin"
+        else:
+            validated_path = validate_document_path(file_path)
 
         bot_api_client = getattr(self, "_bot_api_client", None)
         if bot_api_client is not None:
             kwargs: dict[str, Any] = {
                 "chat_id": chat_id,
-                "file_path": validated_path,
+                "file_path": raw_bytes if is_bytes else validated_path,
                 "caption": caption,
-                "reply_to_msg_id": reply_to_msg_id,
+                "reply_to_msg_id": eff_reply_to,
                 "simulate_typing": simulate_typing,
                 "filename": filename,
             }
+            if mime_type is not None:
+                kwargs["mime_type"] = mime_type
             if timeout != 120.0:
                 kwargs["timeout"] = timeout
             return await bot_api_client.send_document(**kwargs)
@@ -513,19 +685,30 @@ class TelegramUserbot:
 
         send_kwargs: dict[str, Any] = {
             "caption": caption,
-            "reply_to": reply_to_msg_id,
+            "reply_to": eff_reply_to,
             "force_document": True,
         }
-        if filename:
+        if is_bytes:
+            send_kwargs["attributes"] = [DocumentAttributeFilename(file_name=safe_name)]
+        elif filename:
             send_kwargs["attributes"] = [
                 DocumentAttributeFilename(file_name=Path(filename).name)
             ]
+        if mime_type is not None:
+            send_kwargs["mime_type"] = mime_type
 
         for attempt in range(2):
             try:
+                if is_bytes:
+                    buf = io.BytesIO(raw_bytes)
+                    buf.name = safe_name
+                    file_obj: Any = buf
+                else:
+                    file_obj = str(validated_path)
+
                 coro = self.client.send_file(
                     chat_id,
-                    str(validated_path),
+                    file_obj,
                     **send_kwargs,
                 )
                 if timeout > 0:
@@ -561,51 +744,77 @@ class TelegramUserbot:
     async def send_voice(
         self,
         chat_id: int,
-        voice_path: str | Path,
+        voice_path: bytes | str | Path,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         duration: Optional[int | float] = None,
         simulate_typing: bool = True,
         timeout: float = 60.0,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Any:
-        """Send a voice message to a chat via Bot API or Telethon after path/size validation."""
-        validated_path = validate_document_path(voice_path)
+        """Send a voice message (from path or raw bytes) via Bot API or Telethon after validation."""
+        eff_reply_to = reply_to_message_id if reply_to_message_id is not None else reply_to_msg_id
+
+        is_bytes = isinstance(voice_path, (bytes, bytearray))
+        raw_bytes = b""
+        safe_name = "voice.ogg"
+        validated_path: Optional[Path] = None
+
+        if is_bytes:
+            raw_bytes = _validate_media_bytes(voice_path, kind="Voice")
+            safe_name = Path(filename or "voice.ogg").name or "voice.ogg"
+        else:
+            validated_path = validate_document_path(voice_path)
 
         bot_api_client = getattr(self, "_bot_api_client", None)
         if bot_api_client is not None:
-            return await bot_api_client.send_voice(
-                chat_id=chat_id,
-                voice_path=validated_path,
-                caption=caption,
-                reply_to_msg_id=reply_to_msg_id,
-                duration=duration,
-                simulate_typing=simulate_typing,
-                timeout=timeout,
-            )
+            bot_kwargs: dict[str, Any] = {
+                "chat_id": chat_id,
+                "voice_path": raw_bytes if is_bytes else validated_path,
+                "caption": caption,
+                "reply_to_msg_id": eff_reply_to,
+                "duration": duration,
+                "simulate_typing": simulate_typing,
+                "timeout": timeout,
+            }
+            if filename is not None:
+                bot_kwargs["filename"] = filename
+            if mime_type is not None:
+                bot_kwargs["mime_type"] = mime_type
+            return await bot_api_client.send_voice(**bot_kwargs)
 
         if simulate_typing:
             await self._simulate_chat_action(chat_id, "record-voice", caption or "")
 
         send_kwargs: dict[str, Any] = {
             "caption": caption,
-            "reply_to": reply_to_msg_id,
+            "reply_to": eff_reply_to,
             "voice_note": True,
         }
         if duration is not None:
-            from telethon.tl.types import DocumentAttributeAudio
-
             send_kwargs["attributes"] = [
                 DocumentAttributeAudio(
                     duration=max(0, int(round(float(duration)))),
                     voice=True,
                 )
             ]
+        if mime_type is not None:
+            send_kwargs["mime_type"] = mime_type
 
         for attempt in range(2):
             try:
+                if is_bytes:
+                    buf = io.BytesIO(raw_bytes)
+                    buf.name = safe_name
+                    file_obj: Any = buf
+                else:
+                    file_obj = str(validated_path)
+
                 coro = self.client.send_file(
                     chat_id,
-                    str(validated_path),
+                    file_obj,
                     **send_kwargs,
                 )
                 if timeout > 0:

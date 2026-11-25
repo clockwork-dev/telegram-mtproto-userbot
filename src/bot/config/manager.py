@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import yaml
 
@@ -30,29 +30,26 @@ class ConfigManager:
             self.config_dir = self.bot_path.parent
         else:
             self.config_dir = Path(config_dir).resolve()
-            for candidate_name in ("bot.yaml", "userbot.yaml", "userbot.example.yaml"):
-                cand = self.config_dir / candidate_name
-                if cand.exists():
-                    self.bot_path = cand
-                    break
-            else:
-                self.bot_path = self.config_dir / "userbot.yaml"
+            self.bot_path = self.config_dir / "bot.yaml"
+            if not self.bot_path.exists():
+                for candidate_name in ("userbot.yaml", "userbot.example.yaml", "bot.example.yaml"):
+                    candidate_path = self.config_dir / candidate_name
+                    if candidate_path.exists():
+                        self.bot_path = candidate_path
+                        break
 
         self.friends_path = self.config_dir / "friends.yaml"
         if system_prompt_path is not None:
             self.system_prompt_path = Path(system_prompt_path).resolve()
         else:
-            for sp_name in (
-                "userbot_system_prompt.md",
-                "userbot_system_prompt.example.md",
-                "system_prompt.md",
-            ):
-                sp_cand = self.config_dir / sp_name
-                if sp_cand.exists():
-                    self.system_prompt_path = sp_cand
-                    break
+            candidate_userbot_prompt = self.config_dir / "userbot_system_prompt.md"
+            candidate_userbot_example = self.config_dir / "userbot_system_prompt.example.md"
+            if "userbot" in self.bot_path.stem.lower() and candidate_userbot_prompt.exists():
+                self.system_prompt_path = candidate_userbot_prompt
+            elif "userbot" in self.bot_path.stem.lower() and candidate_userbot_example.exists():
+                self.system_prompt_path = candidate_userbot_example
             else:
-                self.system_prompt_path = self.config_dir / "userbot_system_prompt.md"
+                self.system_prompt_path = self.config_dir / "system_prompt.md"
 
         self.bot: Optional[BotConfig] = None
         self.friends: FriendsConfig = FriendsConfig()
@@ -61,8 +58,14 @@ class ConfigManager:
         self._mtimes: Dict[Path, float] = {}
         self._watcher_task: Optional[asyncio.Task] = None
         self._running: bool = False
+        self._reload_callbacks: List[Callable[[], None]] = []
 
         self.load_all()
+
+    def register_reload_callback(self, callback: Callable[[], None]) -> None:
+        """Register a synchronous callback invoked after config files hot-reload."""
+        if callback not in self._reload_callbacks:
+            self._reload_callbacks.append(callback)
 
     def _get_mtime(self, path: Path) -> float:
         try:
@@ -71,7 +74,7 @@ class ConfigManager:
             return 0.0
 
     def load_bot(self) -> BotConfig:
-        """Load and validate bot.yaml."""
+        """Load and validate bot/userbot YAML configuration."""
         if not self.bot_path.exists():
             raise FileNotFoundError(f"Configuration file not found: {self.bot_path}")
         with open(self.bot_path, "r", encoding="utf-8") as f:
@@ -123,7 +126,7 @@ class ConfigManager:
         """Check file mtimes and reload any updated configuration file atomically."""
         updated = False
 
-        # 1. bot.yaml
+        # 1. bot.yaml / userbot.yaml
         cur_bot_mtime = self._get_mtime(self.bot_path)
         if cur_bot_mtime != self._mtimes.get(self.bot_path):
             try:
@@ -155,7 +158,7 @@ class ConfigManager:
                     e,
                 )
 
-        # 3. system_prompt.md
+        # 3. system_prompt.md / userbot_system_prompt.md
         cur_prompt_mtime = self._get_mtime(self.system_prompt_path)
         if cur_prompt_mtime != self._mtimes.get(self.system_prompt_path):
             try:
@@ -170,6 +173,13 @@ class ConfigManager:
                     self.system_prompt_path,
                     e,
                 )
+
+        if updated:
+            for callback in list(self._reload_callbacks):
+                try:
+                    callback()
+                except Exception as exc:
+                    logger.warning("Config reload callback failed: %s", exc)
 
         return updated
 

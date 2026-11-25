@@ -30,33 +30,10 @@ from bot.telegram.client import TelegramUserbot
 from bot.telegram.heuristics import ReplyAction, ReplyHeuristics
 
 
-def _load_smoke_config(tmp_path: Path):
-    import shutil
-
-    import yaml
-
-    from bot.config.manager import ConfigManager
-
-    cfg_dir = tmp_path / "_smoke_cfg"
-    if not cfg_dir.exists():
-        shutil.copytree(Path("config").resolve(), cfg_dir)
-        ex = cfg_dir / "userbot.example.yaml"
-        if ex.is_file():
-            data = yaml.safe_load(ex.read_text(encoding="utf-8"))
-            data["telegram"]["allowed_chat_ids"] = [-1001234567890]
-            data["behavior"]["bot_names"] = ["піструнькиня", "Джефф", "jeff"]
-            data["proactive"]["enabled"] = True
-            (cfg_dir / "userbot.yaml").write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-        fr_ex = cfg_dir / "friends.example.yaml"
-        if fr_ex.is_file() and not (cfg_dir / "friends.yaml").is_file():
-            shutil.copy2(fr_ex, cfg_dir / "friends.yaml")
-    return ConfigManager(config_dir=cfg_dir)
-
-
 @pytest.mark.asyncio
 async def test_full_pipeline_dry_run_smoke():
     """Verify full-pipeline dry-run smoke test (incoming msg + photo + FTS5 + friend profile + proactive)."""
-    res = await run_dry_run_smoke("config/userbot.example.yaml")
+    res = await run_dry_run_smoke("config/bot.example.yaml")
     assert res["status"] == "ok"
     assert res["sent_messages_count"] == 1
     assert res["leftover_temp_dirs"] == 0
@@ -66,7 +43,7 @@ async def test_full_pipeline_dry_run_smoke():
 
 def test_cli_dry_run_execution(capsys):
     """Verify `bot.cli main(['run', '--dry-run'])` executes cleanly and outputs JSON status."""
-    rc = main(["run", "--config", "config/userbot.example.yaml", "--dry-run", "--log-level", "WARNING"])
+    rc = main(["run", "--config", "config/bot.example.yaml", "--dry-run", "--log-level", "WARNING"])
     assert rc == 0
     captured = capsys.readouterr()
     data = json.loads(captured.out)
@@ -316,12 +293,17 @@ async def test_orchestrator_reactions_real_msg_id_and_active_window(tmp_path: Pa
     import time
     from unittest.mock import AsyncMock, MagicMock
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_react_msg_id.sqlite"))
     await memory_store.init_db()
 
@@ -488,13 +470,18 @@ async def test_orchestrator_document_generation_and_delivery_e2e(tmp_path: Path)
 
     from pypdf import PdfReader
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.documents.builder import DocumentBuilder
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_doc_e2e.sqlite"))
     await memory_store.init_db()
 
@@ -649,13 +636,18 @@ async def test_orchestrator_doc_only_reply_and_error_resilience(tmp_path: Path) 
     """Verify doc-only [DOC:{...}] reply skips send_reply, updates history, and doc errors don't crash."""
     from unittest.mock import AsyncMock, MagicMock
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.documents.builder import DocumentBuilder
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_doc_only.sqlite"))
     await memory_store.init_db()
 
@@ -784,11 +776,16 @@ async def test_orchestrator_proactive_cron_digest_delivery_and_memory_save(tmp_p
     from unittest.mock import AsyncMock, MagicMock
     from zoneinfo import ZoneInfo
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_cron_digest.sqlite"))
     await memory_store.init_db()
 
@@ -868,11 +865,9 @@ def test_cli_run_digest_dry_run_and_validation(capsys) -> None:
         [
             "run-digest",
             "--config",
-            "config/userbot.example.yaml",
+            "config/bot.example.yaml",
             "--slot",
             "morning_digest",
-            "--chat-id",
-            "-1001234567890",
             "--dry-run",
             "--log-level",
             "WARNING",
@@ -894,7 +889,7 @@ def test_cli_run_digest_dry_run_and_validation(capsys) -> None:
         [
             "run-digest",
             "--config",
-            "config/userbot.example.yaml",
+            "config/bot.example.yaml",
             "--all-due",
             "--dry-run",
             "--log-level",
@@ -912,7 +907,7 @@ def test_cli_run_digest_dry_run_and_validation(capsys) -> None:
         [
             "run-digest",
             "--config",
-            "config/userbot.example.yaml",
+            "config/bot.example.yaml",
             "--slot",
             "nonexistent_slot",
             "--dry-run",
@@ -926,12 +921,25 @@ async def test_orchestrator_skip_fact_cooldown_and_gated_prompts(tmp_path: Path)
     """Verify [SKIP], no author_display FTS pollution, fact cooldown, bot-history suppression, and gated tool prompts."""
     from unittest.mock import AsyncMock, MagicMock
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
+    if not config_mgr.friends.friends:
+        from bot.config.models import FriendProfile
+
+        config_mgr.friends.friends[111222333] = FriendProfile(
+            name="Алексей",
+            aliases=["Лёша"],
+            bio="Любит собирать кастомные клавиатуры",
+        )
     memory_store = MemoryStore(db_path=str(tmp_path / "test_facts_skip.sqlite"))
     await memory_store.init_db()
     media_proc = MediaProcessor(max_doc_size_mb=10, temp_dir_base=str(tmp_path / "tmp_media"))
@@ -1043,12 +1051,17 @@ async def test_orchestrator_media_after_heuristics_and_cli_blind_guard(tmp_path:
     from unittest.mock import AsyncMock, MagicMock
 
     from bot.antigravity import AntigravityCLIClient
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor, ProcessedMedia
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_media_gate.sqlite"))
     await memory_store.init_db()
     media_proc = MediaProcessor(max_doc_size_mb=10, temp_dir_base=str(tmp_path / "tmp_media"))
@@ -1157,12 +1170,17 @@ async def test_orchestrator_debounce_coalescing_and_startup_seeding(tmp_path: Pa
     import time
     from unittest.mock import AsyncMock, MagicMock
 
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor
     from bot.telegram.handlers import IncomingMessage
 
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_debounce_seed.sqlite"))
     await memory_store.init_db()
     media_proc = MediaProcessor(max_doc_size_mb=10, temp_dir_base=str(tmp_path / "tmp_media"))
@@ -1294,6 +1312,7 @@ async def test_orchestrator_reply_image_vision_and_build_attachments(tmp_path: P
     from unittest.mock import AsyncMock, MagicMock
 
     from bot.antigravity import AntigravityConfig, AntigravityProvider
+    from bot.config.manager import ConfigManager
     from bot.core.models import ProviderResponse
     from bot.main import GroupBotOrchestrator
     from bot.media.processor import MediaProcessor, ProcessedMedia
@@ -1332,7 +1351,11 @@ async def test_orchestrator_reply_image_vision_and_build_attachments(tmp_path: P
     assert anim_attachments[0].mime_type == "image/jpeg"
 
     # Set up orchestrator with CLI-only AntigravityProvider (no SDK key) supporting image vision
-    config_mgr = _load_smoke_config(tmp_path)
+    config_mgr = ConfigManager(config_path=Path("config/bot.example.yaml").resolve())
+    if not config_mgr.bot.telegram.allowed_chat_ids:
+        config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
+    if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
+        config_mgr.bot.behavior.bot_names.append("піструнькиня")
     memory_store = MemoryStore(db_path=str(tmp_path / "test_reply_vision.sqlite"))
     await memory_store.init_db()
     chat_id = int(config_mgr.bot.telegram.allowed_chat_ids[0])
@@ -1506,3 +1529,185 @@ async def test_orchestrator_reply_image_vision_and_build_attachments(tmp_path: P
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_userbot_mode_admin_dm_routing_hot_reload_and_mtproto_imagine(tmp_path: Path):
+    """Verify userbot DM smoke, admin_user_ids unioning, hot-reload sync, MTProto img2img, and masculine timeout text."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import yaml
+    from PIL import Image
+
+    from bot.antigravity.errors import ImageTimeoutError
+    from bot.config.manager import ConfigManager
+    from bot.core.models import GeneratedImageResult, ProviderResponse
+    from bot.main import GroupBotOrchestrator, run_dry_run_smoke
+    from bot.media.processor import MediaProcessor
+    from bot.telegram.handlers import IncomingMessage
+
+    # 1. Dry-run smoke against userbot.example.yaml (public template)
+    smoke_res = await run_dry_run_smoke("config/userbot.example.yaml")
+    assert smoke_res["status"] == "ok"
+    assert smoke_res["chat_id"] == -1001234567890
+    assert smoke_res["sent_messages_count"] == 1
+    assert smoke_res["leftover_temp_dirs"] == 0
+
+    # If userbot.yaml is present locally, verify it loads cleanly via ConfigManager (without printing secrets)
+    ub_real = Path("config/userbot.yaml")
+    if ub_real.is_file():
+        ub_mgr = ConfigManager(config_path=ub_real.resolve())
+        assert ub_mgr.bot is not None
+        assert ub_mgr.bot.telegram.mode == "userbot"
+        assert 382962362 in ub_mgr.bot.telegram.admin_user_ids
+        assert "Потужнич" in ub_mgr.bot.behavior.bot_names
+        assert ub_mgr.bot.voice.tts.gemini_ru_voice == "Fenrir"
+        assert ub_mgr.bot.voice.tts.ru_voice == "ru-RU-DmitryNeural"
+        assert ub_mgr.bot.self_evolution.enabled is False
+
+    # 2. Admin-only DM routing (when allowed_dm_user_ids=[] and admin_user_ids=[382962362])
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    tpl = yaml.safe_load(Path("config/userbot.example.yaml").read_text(encoding="utf-8"))
+    tpl["telegram"]["allowed_chat_ids"] = []
+    tpl["telegram"]["allowed_dm_user_ids"] = []
+    tpl["telegram"]["admin_user_ids"] = [382962362]
+    cfg_file = cfg_dir / "userbot.yaml"
+    cfg_file.write_text(yaml.safe_dump(tpl, allow_unicode=True), encoding="utf-8")
+    (cfg_dir / "friends.yaml").write_text("friends: {}\n", encoding="utf-8")
+    (cfg_dir / "userbot_system_prompt.md").write_text("Ты — Джефф.\n", encoding="utf-8")
+
+    config_mgr = ConfigManager(config_path=cfg_file)
+    store = MemoryStore(db_path=str(tmp_path / "ub_e2e.sqlite"))
+    await store.init_db()
+    media_proc = MediaProcessor(max_doc_size_mb=10, temp_dir_base=str(tmp_path / "media_tmp"))
+
+    mock_userbot = MagicMock()
+    mock_userbot.bot_id = 777000
+    mock_userbot.bot_username = "jeff_userbot"
+    mock_userbot.client = MagicMock()
+    mock_userbot.send_typing_action = AsyncMock()
+    mock_userbot.send_reply = AsyncMock(return_value={"id": 1001})
+    mock_userbot.send_photo = AsyncMock(return_value={"id": 1002})
+    mock_userbot.sync_access_lists = MagicMock()
+    mock_userbot.stop = AsyncMock()
+
+    png_buf_path = tmp_path / "gen.png"
+    Image.new("RGB", (32, 32), color=(10, 20, 30)).save(png_buf_path, format="PNG")
+    gen_bytes = png_buf_path.read_bytes()
+
+    ref_photo_path = tmp_path / "replied_ref.jpg"
+    Image.new("RGB", (32, 32), color=(200, 100, 50)).save(ref_photo_path, format="JPEG")
+
+    mock_provider = MagicMock()
+    mock_provider.is_rate_limited = MagicMock(return_value=False)
+    mock_provider.generate_response = AsyncMock(
+        return_value=ProviderResponse(text="Принял в личке, бро.", model="gemini-4-hydrogen")
+    )
+    mock_provider.generate_image = AsyncMock(
+        return_value=GeneratedImageResult(
+            image_bytes=gen_bytes,
+            mime_type="image/png",
+            width=32,
+            height=32,
+            filename="gen.png",
+            prompt_used="cyberpunk cat",
+            model_used="gemini-4-hydrogen",
+        )
+    )
+
+    orchestrator = GroupBotOrchestrator(
+        config_mgr=config_mgr,
+        memory_store=store,
+        media_processor=media_proc,
+        provider=mock_provider,
+        userbot=mock_userbot,
+    )
+    try:
+        # Admin DM without mention/reply is permitted and routed as dm_admin
+        dm_inc = IncomingMessage(
+            msg_id=10,
+            chat_id=382962362,
+            sender_id=382962362,
+            sender_name="Rodion",
+            text="Привет, как статус?",
+            reply_to_msg_id=None,
+            is_reply=False,
+            is_mention=False,
+            raw_event=SimpleNamespace(chat_id=382962362, sender_id=382962362, text="Привет, как статус?"),
+        )
+        dm_reply = await orchestrator.handle_incoming_message(dm_inc)
+        assert dm_reply == "Принял в личке, бро."
+
+        # Hot-reload syncs unioned allowed_dm_user_ids + admin_user_ids to userbot.sync_access_lists
+        tpl["telegram"]["allowed_dm_user_ids"] = [111222333]
+        cfg_file.write_text(yaml.safe_dump(tpl, allow_unicode=True), encoding="utf-8")
+        import os
+
+        st = os.stat(cfg_file)
+        os.utime(cfg_file, (st.st_mtime + 2.0, st.st_mtime + 2.0))
+        assert config_mgr.reload_changed() is True
+        mock_userbot.sync_access_lists.assert_called()
+        synced_kwargs = mock_userbot.sync_access_lists.call_args.kwargs
+        assert set(synced_kwargs["allowed_dm_user_ids"]) == {111222333, 382962362}
+
+        # MTProto /imagine replying to a Telethon photo message extracts reference_images
+        replied_telethon_msg = SimpleNamespace(
+            photo=True,
+            media=True,
+            file_path=str(ref_photo_path),
+        )
+        img_cmd_inc = IncomingMessage(
+            msg_id=11,
+            chat_id=382962362,
+            sender_id=382962362,
+            sender_name="Rodion",
+            text="/imagine сделай в стиле киберпанк --ar 16:9",
+            reply_to_msg_id=9,
+            is_reply=True,
+            is_mention=False,
+            raw_event=SimpleNamespace(
+                chat_id=382962362,
+                sender_id=382962362,
+                is_private=True,
+                is_reply=True,
+                text="/imagine сделай в стиле киберпанк --ar 16:9",
+            ),
+            is_private=True,
+            reply_to_media_event=replied_telethon_msg,
+        )
+        img_res = await orchestrator.handle_incoming_message(img_cmd_inc)
+        assert img_res is not None
+        mock_provider.generate_image.assert_awaited_once()
+        gen_kwargs = mock_provider.generate_image.await_args.kwargs
+        assert gen_kwargs["aspect_ratio"] == "16:9"
+        assert gen_kwargs["reference_images"] is not None
+        assert len(gen_kwargs["reference_images"]) == 1
+        mock_userbot.send_photo.assert_awaited_once()
+
+        # Timeout error uses masculine persona phrasing ("Не успел дорисовать картинку...")
+        mock_provider.generate_image = AsyncMock(side_effect=ImageTimeoutError("timed out"))
+        timeout_inc = IncomingMessage(
+            msg_id=12,
+            chat_id=382962362,
+            sender_id=382962362,
+            sender_name="Rodion",
+            text="/img кот в космосе",
+            reply_to_msg_id=None,
+            is_reply=False,
+            is_mention=False,
+            raw_event=SimpleNamespace(
+                chat_id=382962362,
+                sender_id=382962362,
+                is_private=True,
+                text="/img кот в космосе",
+            ),
+            is_private=True,
+        )
+        timeout_reply = await orchestrator.handle_incoming_message(timeout_inc)
+        assert timeout_reply is not None
+        assert "Не успел дорисовать картинку" in timeout_reply
+        assert "Не успела" not in timeout_reply
+    finally:
+        await orchestrator.stop()

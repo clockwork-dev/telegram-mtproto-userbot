@@ -176,6 +176,11 @@ def test_humor_prompt_sensitive_topics_exclusion():
         forbidden_topics=["политика", "религия"],
     )
 
+    # Verify masculine Potuzhnych persona and zero піструнькиня self-identification
+    assert "Потужнич" in prompt
+    assert "піструнькиня" not in prompt
+    assert "в мужском роде" in prompt
+
     # Verify friend banter topics are included
     assert "Go vs Rust" in prompt
     assert "эргономичные клавиатуры" in prompt

@@ -1,394 +1,122 @@
-"""Tests for error classification, backoff policies, SDK client, CLI client, and AntigravityProvider."""
+"""Tests for error classification, per-model circuit breaker, PreToolUse hooks, CLI/SDK, and image_gen."""
 
 from __future__ import annotations
 
 import io
 import json
-import tempfile
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from bot.antigravity import (
+    AntigravityBillingError,
     AntigravityCLIClient,
     AntigravityConfig,
+    AntigravityNativeToolAbort,
     AntigravityProvider,
+    AntigravityRateLimitError,
     AntigravitySDKClient,
     ErrorCategory,
+    GeneratedImageResult,
+    ImageGenerationError,
+    ImagePolicyRefusalError,
+    ImageTimeoutError,
+    ImageValidationError,
     calculate_backoff,
     classify_error,
+    extract_retry_after,
+    write_chat_pre_tool_hook,
+    write_image_pre_tool_hook,
 )
+from bot.antigravity.cli_client import watch_log_for_errors
 from bot.core.models import MediaAttachment, ProviderResponse
+
+
+def _make_image_bytes(fmt: str = "JPEG", size: tuple[int, int] = (32, 24)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, (220, 40, 40)).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _run_hook(gate_script: Path, payload: str) -> dict[str, Any]:
+    res = subprocess.run(
+        [sys.executable, str(gate_script)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return json.loads(res.stdout.strip())
 
 
 class _MockPopen:
     """Mock subprocess.Popen for CLI client testing."""
 
-    def __init__(self, stdout_lines: list[str], returncode: int = 0) -> None:
+    def __init__(self, stdout_lines: list[str], *, block_until_killed: bool = False, returncode: int = 0) -> None:
         self.stdin = io.StringIO()
-        self.stdout = io.StringIO("\n".join(stdout_lines) + "\n")
+        self._lines = list(stdout_lines)
+        self._idx = 0
+        self._block_until_killed = block_until_killed
+        self._killed = threading.Event()
         self.stderr = io.StringIO("")
         self.pid = 4242
         self.returncode = returncode
         self._terminated = False
+        outer = self
+
+        class _Stdout:
+            def readline(self) -> str:
+                if outer._block_until_killed:
+                    outer._killed.wait(timeout=5.0)
+                    return ""
+                if outer._idx < len(outer._lines):
+                    line = outer._lines[outer._idx]
+                    outer._idx += 1
+                    return line if line.endswith("\n") else line + "\n"
+                return ""
+
+            def close(self) -> None:
+                pass
+
+        self.stdout = _Stdout()
 
     def poll(self) -> int | None:
         return self.returncode if self._terminated else None
 
     def terminate(self) -> None:
         self._terminated = True
+        self._killed.set()
 
     def kill(self) -> None:
         self._terminated = True
+        self._killed.set()
 
     def wait(self, timeout: float | None = None) -> int:
         self._terminated = True
+        self._killed.set()
         return self.returncode
-
-
-def test_error_classification_pipeline():
-    # 1. 429 Rate limit
-    v1 = classify_error("429 Too Many Requests: Resource has been exhausted")
-    assert v1.category == ErrorCategory.RATE_LIMIT
-    assert v1.retryable is True
-    assert v1.should_fallback is True
-
-    # 2. Server error / output token cutoff
-    v2 = classify_error("Previous response was cut off because it exceeded the output token limit")
-    assert v2.category == ErrorCategory.SERVER_ERROR
-    assert v2.retryable is True
-    assert v2.should_compress is False
-
-    # 3. Context overflow
-    v3 = classify_error("max_trajectory_tokens exceeded: prompt is too long")
-    assert v3.category == ErrorCategory.CONTEXT_OVERFLOW
-    assert v3.retryable is True
-    assert v3.should_compress is True
-
-    # 4. Billing
-    v4 = classify_error("AI credits balance is too low to process this request")
-    assert v4.category == ErrorCategory.BILLING
-    assert v4.retryable is False
-    assert v4.should_fallback is True
-
-    # 5. Auth permanent
-    v5 = classify_error("OAuth token expired, please re-authenticate")
-    assert v5.category == ErrorCategory.AUTH_PERMANENT
-    assert v5.retryable is False
-    assert v5.should_fallback is True
-
-
-def test_exponential_backoff_calculation():
-    d0 = calculate_backoff(0, base_delay=1.0, max_delay=30.0, jitter=False)
-    d1 = calculate_backoff(1, base_delay=1.0, max_delay=30.0, jitter=False)
-    d2 = calculate_backoff(2, base_delay=1.0, max_delay=30.0, jitter=False)
-    d_max = calculate_backoff(10, base_delay=1.0, max_delay=30.0, jitter=False)
-
-    assert d0 == 1.0
-    assert d1 == 2.0
-    assert d2 == 4.0
-    assert d_max == 30.0
-
-
-@pytest.mark.asyncio
-async def test_cli_client_execution():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cli = AntigravityCLIClient(data_dir=tmpdir, binary="/mock/bin/agy")
-
-        stdout_lines = [
-            json.dumps({"event": "init", "conversation_id": "conv_cli_01"}),
-            json.dumps({
-                "event": "step_update",
-                "step_update": {
-                    "text_delta": "Response from CLI fallback.",
-                    "thinking_delta": "Thinking step...",
-                    "usage": {"input_tokens": 50, "output_tokens": 15},
-                },
-            }),
-            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}),
-        ]
-        mock_proc = _MockPopen(stdout_lines)
-
-        with patch("bot.antigravity.cli_client.popen_isolated_session", return_value=mock_proc):
-            resp = await cli.generate_response(prompt="Hello CLI")
-
-        assert resp.text == "Response from CLI fallback."
-        assert resp.thinking == "Thinking step..."
-        assert resp.conversation_id == "conv_cli_01"
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 50
-        assert resp.usage.completion_tokens == 15
-        cli.close()
-
-
-@pytest.mark.asyncio
-async def test_sdk_client_execution():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        sdk_client = AntigravitySDKClient(data_dir=tmpdir, default_model="gemini-3.8-flash")
-
-        # Mock Agent and ChatResponse
-        mock_response = MagicMock()
-        mock_response.text = AsyncMock(return_value="Direct SDK response text.")
-        mock_response.stop_reason = "stop"
-
-        async def _mock_thoughts():
-            yield "SDK reasoning token 1"
-            yield "SDK reasoning token 2"
-
-        mock_response.thoughts = _mock_thoughts()
-        mock_response.usage_metadata = MagicMock(
-            prompt_token_count=120,
-            candidates_token_count=30,
-            total_token_count=150,
-            thoughts_token_count=10,
-            cached_content_token_count=20,
-        )
-
-        mock_agent = MagicMock()
-        mock_agent.chat = AsyncMock(return_value=mock_response)
-        mock_agent.conversation_id = "sdk_conv_99"
-        mock_agent.__aenter__ = AsyncMock(return_value=mock_agent)
-        mock_agent.__aexit__ = AsyncMock(return_value=None)
-
-        with patch("bot.antigravity.sdk_client.Agent", return_value=mock_agent):
-            resp = await sdk_client.generate_response(
-                prompt="Hello SDK",
-                system_instructions="You are a helpful assistant.",
-            )
-
-        assert resp.text == "Direct SDK response text."
-        assert "SDK reasoning token 1" in (resp.thinking or "")
-        assert resp.conversation_id == "sdk_conv_99"
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 120
-        assert resp.usage.completion_tokens == 30
-        assert resp.usage.reasoning_tokens == 10
-
-
-@pytest.mark.asyncio
-async def test_antigravity_provider_sdk_primary_with_cli_fallback(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-api-key")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = AntigravityConfig(
-            data_dir=Path(tmpdir),
-            enable_sdk=True,
-            enable_cli_fallback=True,
-            max_retries=1,
-        )
-        provider = AntigravityProvider(config=cfg)
-        assert provider._sdk_client is not None
-
-        # 1. SDK Success path
-        mock_sdk_resp = ProviderResponse(text="SDK Answer", model="gemini-3.8-flash")
-        provider._sdk_client.generate_response = AsyncMock(return_value=mock_sdk_resp)
-
-        resp1 = await provider.generate_response(prompt="Test Prompt")
-        assert resp1.text == "SDK Answer"
-        provider._sdk_client.generate_response.assert_awaited_once()
-
-        # 2. SDK Failure -> CLI Fallback path
-        provider._sdk_client.generate_response = AsyncMock(
-            side_effect=RuntimeError("SDK service unavailable: 503")
-        )
-        mock_cli_resp = ProviderResponse(text="CLI Fallback Answer", model="gemini-3.8-flash")
-        provider._cli_client.generate_response = AsyncMock(return_value=mock_cli_resp)
-
-        resp2 = await provider.generate_response(prompt="Fallback Prompt")
-        assert resp2.text == "CLI Fallback Answer"
-        provider._cli_client.generate_response.assert_awaited_once()
-
-        provider.close()
-
-
-@pytest.mark.asyncio
-async def test_antigravity_provider_skips_sdk_without_api_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = AntigravityConfig(
-            data_dir=Path(tmpdir),
-            enable_sdk=True,
-            enable_cli_fallback=True,
-        )
-        provider = AntigravityProvider(config=cfg)
-        assert provider._sdk_client is None
-        assert provider._cli_client is not None
-
-        provider._cli_client.generate_response = AsyncMock(
-            return_value=ProviderResponse(text="Direct CLI response", model="gemini-4-hydrogen")
-        )
-        resp = await provider.generate_response(prompt="Hello")
-        assert resp.text == "Direct CLI response"
-        provider._cli_client.generate_response.assert_awaited_once()
-        provider.close()
-
-
-@pytest.mark.asyncio
-async def test_cli_client_stateless_turns_use_fresh_cascades_and_disable_slash_commands():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cli = AntigravityCLIClient(data_dir=tmpdir, binary="/mock/bin/agy")
-
-        spawned_cmds: list[list[str]] = []
-        turn_counter = {"n": 0}
-
-        def fake_popen(cmd, *, cwd, env):
-            spawned_cmds.append(list(cmd))
-            turn_counter["n"] += 1
-            cid = f"conv_fresh_{turn_counter['n']}"
-            return _MockPopen([
-                json.dumps({"event": "init", "conversation_id": cid}),
-                json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": f"Reply {turn_counter['n']}"}}),
-            ])
-
-        with patch("bot.antigravity.cli_client.popen_isolated_session", side_effect=fake_popen):
-            r1 = await cli.generate_response(prompt="Turn 1", conversation_id=None)
-            r2 = await cli.generate_response(prompt="Turn 2", conversation_id=None)
-
-        assert r1.conversation_id == "conv_fresh_1"
-        assert r2.conversation_id == "conv_fresh_2"
-        assert len(spawned_cmds) == 2
-        for cmd in spawned_cmds:
-            assert "--disable-slash-commands" in cmd
-            assert "--input-format" in cmd
-            assert "--output-format" in cmd
-        assert cli._worker_proc is None
-        cli.close()
-
-
-def test_cli_client_idle_worker_timeout_terminates_worker():
-    import time
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cli = AntigravityCLIClient(
-            data_dir=tmpdir,
-            binary="/mock/bin/agy",
-            worker_idle_timeout_seconds=0.05,
-        )
-        mock_proc = _MockPopen([])
-        spawned_cmds: list[list[str]] = []
-
-        def fake_popen(cmd, *, cwd, env):
-            spawned_cmds.append(list(cmd))
-            return mock_proc
-
-        with patch("bot.antigravity.cli_client.popen_isolated_session", side_effect=fake_popen):
-            proc, _drainer, _gdir = cli._ensure_worker("gemini-4-hydrogen", "low")
-            assert proc is mock_proc
-            assert "--disable-slash-commands" in spawned_cmds[0]
-            assert mock_proc._terminated is False
-
-            deadline = time.monotonic() + 2.0
-            while cli._worker_proc is not None and time.monotonic() < deadline:
-                time.sleep(0.02)
-
-            assert cli._worker_proc is None
-            assert mock_proc._terminated is True
-        cli.close()
-
-
-@pytest.mark.asyncio
-async def test_antigravity_provider_rate_limit_circuit_breaker_and_no_hammering(monkeypatch):
-    from bot.antigravity.errors import (
-        AntigravityBillingError,
-        AntigravityError,
-        AntigravityRateLimitError,
-    )
-
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = AntigravityConfig(
-            data_dir=Path(tmpdir),
-            enable_sdk=False,
-            enable_cli_fallback=True,
-            max_retries=3,
-            rate_limit_max_retries=0,
-            rate_limit_cooldown_seconds=300.0,
-        )
-        provider = AntigravityProvider(config=cfg)
-        assert provider.is_rate_limited() is False
-        assert provider.cooldown_remaining() == 0.0
-
-        cli_mock = AsyncMock(
-            side_effect=AntigravityRateLimitError(
-                "429 Too Many Requests: RESOURCE_EXHAUSTED, retry_after=120s"
-            )
-        )
-        provider._cli_client.generate_response = cli_mock
-
-        # 1. First failure triggers 0 retries (1 attempt, not 3x!) and opens circuit breaker
-        with pytest.raises(AntigravityRateLimitError):
-            await provider.generate_response(prompt="Hello")
-        assert cli_mock.await_count == 1
-        assert provider.is_rate_limited() is True
-        assert 100.0 <= provider.cooldown_remaining() <= 120.5
-
-        # 2. Second call fails fast without touching CLI/network
-        with pytest.raises(AntigravityError):
-            await provider.generate_response(prompt="Hello again")
-        assert cli_mock.await_count == 1
-
-        # 3. Reset and verify BILLING also opens circuit breaker
-        provider.reset_cooldown()
-        assert provider.is_rate_limited() is False
-        billing_mock = AsyncMock(
-            side_effect=AntigravityBillingError("AI credits balance is too low")
-        )
-        provider._cli_client.generate_response = billing_mock
-
-        with pytest.raises(AntigravityBillingError):
-            await provider.generate_response(prompt="Billing check")
-        assert billing_mock.await_count == 1
-        assert provider.is_rate_limited() is True
-        assert provider.cooldown_remaining() > 250.0
-
-        with pytest.raises(AntigravityBillingError):
-            await provider.generate_response(prompt="Blocked by billing cooldown")
-        assert billing_mock.await_count == 1
-
-        provider.close()
-
-
-@pytest.mark.asyncio
-async def test_antigravity_provider_media_attachments():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = AntigravityConfig(data_dir=Path(tmpdir), enable_sdk=False, enable_cli_fallback=True)
-        provider = AntigravityProvider(config=cfg)
-
-        mock_cli_resp = ProviderResponse(text="Processed photo and question.")
-        provider._cli_client.generate_response = AsyncMock(return_value=mock_cli_resp)
-
-        attachment = MediaAttachment(
-            mime_type="image/jpeg",
-            description="A photo of a white cat sitting on a table",
-        )
-        resp = await provider.generate_response(
-            prompt="What is in the image?",
-            media_attachments=[attachment],
-        )
-
-        assert resp.text == "Processed photo and question."
-        called_prompt = provider._cli_client.generate_response.call_args[1]["prompt"]
-        assert "A photo of a white cat sitting on a table" in called_prompt
-        assert "What is in the image?" in called_prompt
-        called_atts = provider._cli_client.generate_response.call_args[1]["media_attachments"]
-        assert called_atts == [attachment]
-
-        provider.close()
 
 
 class _InteractiveAcpPopen:
     """Mock subprocess.Popen simulating an `agy acp --stdio` JSON-RPC 2.0 server."""
 
-    def __init__(self, *, expected_mime: str = "image/jpeg") -> None:
-        self.expected_mime = expected_mime
-        self.sent_requests: list[dict] = []
+    def __init__(self) -> None:
+        self.sent_requests: list[dict[str, Any]] = []
         self._responses: list[str] = []
         self._resp_idx = 0
         self.stderr = io.StringIO("")
         self.pid = 5252
         self.returncode = 0
         self._terminated = False
-
         outer = self
 
         class _StdinProxy:
@@ -412,6 +140,9 @@ class _InteractiveAcpPopen:
                     return line
                 return ""
 
+            def close(self) -> None:
+                pass
+
         self.stdin = _StdinProxy()
         self.stdout = _StdoutProxy()
 
@@ -421,9 +152,7 @@ class _InteractiveAcpPopen:
         mid = msg.get("id")
         method = msg.get("method")
         if method == "initialize":
-            self._responses.append(
-                json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}) + "\n"
-            )
+            self._responses.append(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}) + "\n")
         elif method == "session/new":
             self._responses.append(
                 json.dumps({
@@ -433,10 +162,7 @@ class _InteractiveAcpPopen:
                         "sessionId": "acp_sess_1",
                         "models": {
                             "currentModelId": "gemini-4-argon-medium",
-                            "availableModels": [
-                                {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
-                                {"modelId": "gemini-4-hydrogen-medium", "name": "Gemini 4 Hydrogen (Medium)"},
-                            ],
+                            "availableModels": [{"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash"}],
                         },
                     },
                 })
@@ -485,63 +211,281 @@ class _InteractiveAcpPopen:
         return self.returncode
 
 
+def test_error_classification_retry_after_and_backoff():
+    assert classify_error("429 Too Many Requests: Resource has been exhausted").category == ErrorCategory.RATE_LIMIT
+    assert classify_error("Previous response was cut off because it exceeded the output token limit").category == ErrorCategory.SERVER_ERROR
+    assert classify_error("max_trajectory_tokens exceeded: prompt is too long").category == ErrorCategory.CONTEXT_OVERFLOW
+    assert classify_error("AI credits balance is too low").category == ErrorCategory.BILLING
+    assert classify_error("OAuth token expired, please re-authenticate").category == ErrorCategory.AUTH_PERMANENT
+    assert classify_error("Unknown model foo-99").category == ErrorCategory.MODEL_NOT_FOUND
+    assert extract_retry_after("429 RESOURCE_EXHAUSTED, retry in 1h 2m 3s") == 3723.0
+    assert calculate_backoff(2, base_delay=1.0, max_delay=30.0, jitter=False) == 4.0
+
+
 @pytest.mark.asyncio
-async def test_cli_client_acp_image_vision_jpeg_and_webp(tmp_path: Path):
-    from PIL import Image
+async def test_cli_and_sdk_execution_and_acp_vision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cli = AntigravityCLIClient(data_dir=tmp_path / "agy", binary="/mock/bin/agy", default_model="gemini-3.8-flash", default_effort="low")
+    stdout_lines = [
+        json.dumps({"event": "init", "conversation_id": "conv_cli_01"}),
+        json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "text_delta": "Response from CLI.",
+                "thinking_delta": "Thinking...",
+                "usage": {"input_tokens": 50, "output_tokens": 15},
+            },
+        }),
+        json.dumps({"event": "result", "result": {"status": "SUCCESS"}}),
+    ]
+    with patch("bot.antigravity.cli_client.popen_isolated_session", return_value=_MockPopen(stdout_lines)):
+        resp = await cli.generate_response(prompt="Hello CLI")
+    assert resp.text == "Response from CLI."
+    assert resp.conversation_id == "conv_cli_01"
 
+    # ACP image vision
     jpeg_path = tmp_path / "cat.jpg"
-    Image.new("RGB", (16, 16), (255, 80, 0)).save(jpeg_path, format="JPEG")
-
-    webp_path = tmp_path / "sticker.webp"
-    Image.new("RGBA", (16, 16), (0, 200, 100, 255)).save(webp_path, format="WEBP")
-
-    cli = AntigravityCLIClient(
-        data_dir=tmp_path,
-        binary="/mock/bin/agy",
-        default_model="gemini-3.8-flash",
-        default_effort="low",
-    )
-
-    # 1. JPEG image attachment routed to `agy acp --stdio`
-    acp_jpeg = _InteractiveAcpPopen(expected_mime="image/jpeg")
-    cmds: list[list[str]] = []
-
-    def fake_popen(cmd, *, cwd, env):
-        cmds.append(list(cmd))
-        return acp_jpeg
-
-    with patch("bot.antigravity.cli_client.popen_isolated_session", side_effect=fake_popen):
-        resp1 = await cli.generate_response(
+    jpeg_path.write_bytes(_make_image_bytes("JPEG"))
+    acp_proc = _InteractiveAcpPopen()
+    with patch("bot.antigravity.cli_client.popen_isolated_session", return_value=acp_proc):
+        resp_img = await cli.generate_response(
             prompt="Что на картинке?",
-            system_instructions="Будь кратким",
             media_attachments=[MediaAttachment(file_path=jpeg_path, mime_type="image/jpeg")],
         )
+    assert resp_img.text == "На фото рыжий кот."
+    cli.close()
 
-    assert cmds[0] == ["/mock/bin/agy", "acp", "--stdio"]
-    assert resp1.text == "На фото рыжий кот."
-    assert resp1.conversation_id == "acp_sess_1"
-    assert resp1.usage is not None and resp1.usage.prompt_tokens == 250
+    # SDK primary -> CLI fallback
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-api-key")
+    provider = AntigravityProvider(AntigravityConfig(data_dir=tmp_path / "p_agy", enable_sdk=True, enable_cli_fallback=True, max_retries=1))
+    if provider._sdk_client is not None:
+        provider._sdk_client.generate_response = AsyncMock(side_effect=RuntimeError("SDK unavailable 503"))
+    assert provider._cli_client is not None
+    provider._cli_client.generate_response = AsyncMock(return_value=ProviderResponse(text="Fallback OK", model="gemini-3.8-flash"))
+    resp_fb = await provider.generate_response(prompt="Fallback")
+    assert resp_fb.text == "Fallback OK"
+    provider.close()
 
-    prompt_req = [r for r in acp_jpeg.sent_requests if r.get("method") == "session/prompt"][0]
-    blocks = prompt_req["params"]["prompt"]
-    assert blocks[0] == {"type": "text", "text": "Что на картинке?"}
-    assert blocks[1]["type"] == "image"
-    assert blocks[1]["mimeType"] == "image/jpeg"
-    assert len(blocks[1]["data"]) > 10
+    # Direct SDK unit check if installed
+    if provider._sdk_client is not None:
+        sdk_client = AntigravitySDKClient(data_dir=tmp_path / "sdk_agy", default_model="gemini-3.8-flash")
+        mock_response = MagicMock(text=AsyncMock(return_value="SDK OK"), stop_reason="stop", usage_metadata=None)
+        mock_agent = MagicMock(chat=AsyncMock(return_value=mock_response), conversation_id="sdk_1")
+        mock_agent.__aenter__ = AsyncMock(return_value=mock_agent)
+        mock_agent.__aexit__ = AsyncMock(return_value=None)
+        with patch("bot.antigravity.sdk_client.Agent", return_value=mock_agent):
+            sdk_resp = await sdk_client.generate_response(prompt="Hi SDK")
+        assert sdk_resp.text == "SDK OK"
 
-    new_req = [r for r in acp_jpeg.sent_requests if r.get("method") == "session/new"][0]
-    assert new_req["params"]["_meta"]["antigravity"]["systemPrompt"]["append"] == "Будь кратким"
 
-    set_model_req = [r for r in acp_jpeg.sent_requests if r.get("method") == "session/set_model"][0]
-    assert set_model_req["params"]["modelId"] == "gemini-3.8-flash-low"
-
-    # 2. WebP sticker normalized to PNG for ACP image compatibility
-    acp_webp = _InteractiveAcpPopen(expected_mime="image/png")
-    with patch("bot.antigravity.cli_client.popen_isolated_session", return_value=acp_webp):
-        await cli.generate_response(
-            prompt="Оцени стикер",
-            media_attachments=[MediaAttachment(file_path=webp_path, mime_type="image/webp")],
+@pytest.mark.asyncio
+async def test_per_model_circuit_breaker_and_watch_log_quota_warning(tmp_path: Path):
+    provider = AntigravityProvider(
+        AntigravityConfig(
+            data_dir=tmp_path / "agy",
+            enable_sdk=False,
+            enable_cli_fallback=True,
+            rate_limit_max_retries=0,
+            rate_limit_cooldown_seconds=300.0,
         )
-    webp_req = [r for r in acp_webp.sent_requests if r.get("method") == "session/prompt"][0]
-    assert webp_req["params"]["prompt"][1]["mimeType"] == "image/png"
+    )
+    assert provider._cli_client is not None
+    provider._cli_client.generate_response = AsyncMock(
+        side_effect=AntigravityRateLimitError("429 Too Many Requests: retry_after=120s")
+    )
+
+    with pytest.raises(AntigravityRateLimitError):
+        await provider.generate_response(prompt="Hi", model="gemini-4-hydrogen")
+    assert provider.is_rate_limited("gemini-4-hydrogen") is True
+    # Other models remain unblocked!
+    assert provider.is_rate_limited("gemini-3.8-flash") is False
+
+    provider._cli_client.generate_response = AsyncMock(
+        return_value=ProviderResponse(text="Flash still works", model="gemini-3.8-flash")
+    )
+    ok_resp = await provider.generate_response(prompt="Hi flash", model="gemini-3.8-flash")
+    assert ok_resp.text == "Flash still works"
+
+    # Historical log skip + soft quota warning forwarding
+    gemini_dir = tmp_path / ".gemini" / "antigravity-cli"
+    gemini_dir.mkdir(parents=True)
+    cli_log = gemini_dir / "cli.log"
+    cli_log.write_text("RESOURCE_EXHAUSTED: historical error\n", encoding="utf-8")
+    old_mtime = time.time() - 60.0
+    os.utime(cli_log, (old_mtime, old_mtime))
+
+    stop_ev = threading.Event()
+    errors: list[str] = []
+    warnings: list[tuple[str | None, float | None, str | None]] = []
+    t = threading.Thread(
+        target=watch_log_for_errors,
+        args=(gemini_dir, stop_ev, errors, None),
+        kwargs={"on_quota_warning": lambda m, p, r: warnings.append((m, p, r))},
+        daemon=True,
+    )
+    t.start()
+    time.sleep(0.3)
+    assert errors == []
+    with cli_log.open("a", encoding="utf-8") as fh:
+        fh.write("[quota] model gemini-4-hydrogen is low on quota (15% remaining, resets at 2026-11-25T00:00:00Z)\n")
+        fh.flush()
+    deadline = time.monotonic() + 2.0
+    while not warnings and time.monotonic() < deadline:
+        time.sleep(0.05)
+    stop_ev.set()
+    t.join(timeout=1.0)
+    assert len(warnings) == 1 and warnings[0][0] == "gemini-4-hydrogen" and warnings[0][1] == 15.0
+    provider.close()
+
+
+def test_chat_and_image_pre_tool_hook_firewalls(tmp_path: Path):
+    # 1. Chat & zero-tool PreToolUse firewall
+    _, chat_gate = write_chat_pre_tool_hook(tmp_path / "chat_sb")
+    assert _run_hook(chat_gate, json.dumps({"toolCall": {"name": "search_web", "args": {}}}))["decision"] == "allow"
+    assert _run_hook(chat_gate, json.dumps({"toolCall": {"name": "read_file", "args": {"Path": ".env"}}}))["decision"] == "deny"
+    assert _run_hook(chat_gate, "{malformed")["decision"] == "deny"
+
+    _, zero_gate = write_chat_pre_tool_hook(tmp_path / "zero_sb", allowed_tools=frozenset())
+    assert _run_hook(zero_gate, json.dumps({"toolCall": {"name": "search_web", "args": {}}}))["decision"] == "deny"
+
+    # 2. Image PreToolUse firewall (with staged inputs + symlink escape rejection)
+    req_cwd = tmp_path / "img_req"
+    inputs_dir = req_cwd / "inputs"
+    inputs_dir.mkdir(parents=True)
+    staged = inputs_dir / "ref_0.jpg"
+    staged.write_bytes(_make_image_bytes("JPEG"))
+    outside = tmp_path / "secret.env"
+    outside.write_text("SECRET=1", encoding="utf-8")
+    sym_escape = inputs_dir / "escape.jpg"
+    sym_escape.symlink_to(outside)
+
+    _, gate_no_in = write_image_pre_tool_hook(req_cwd, allow_staged_inputs=False)
+    assert _run_hook(gate_no_in, json.dumps({"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "image-generator"}}}))["decision"] == "allow"
+    assert _run_hook(gate_no_in, json.dumps({"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self"}}}))["decision"] == "deny"
+    assert _run_hook(gate_no_in, json.dumps({"toolCall": {"name": "generate_image", "args": {"Prompt": "cat"}}}))["decision"] == "allow"
+    assert _run_hook(gate_no_in, json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(staged)}}}))["decision"] == "deny"
+    assert _run_hook(gate_no_in, json.dumps({"toolCall": {"name": "run_command", "args": {}}}))["decision"] == "deny"
+
+    _, gate_with_in = write_image_pre_tool_hook(req_cwd, allow_staged_inputs=True)
+    assert _run_hook(gate_with_in, json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(staged)}}}))["decision"] == "allow"
+    assert _run_hook(gate_with_in, json.dumps({"toolCall": {"name": "generate_image", "args": {"ImagePaths": [str(staged)]}}}))["decision"] == "allow"
+    assert _run_hook(gate_with_in, json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(sym_escape)}}}))["decision"] == "deny"
+    assert _run_hook(gate_with_in, json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(outside)}}}))["decision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_cli_and_provider_generate_image_lifecycle_and_errors(tmp_path: Path):
+    data_dir = tmp_path / "agy_home"
+    out_dir = tmp_path / "img_tmp"
+    conv_id = "conv-img-ok-01"
+    jpg_bytes = _make_image_bytes("JPEG", (64, 48))
+    ref_src = tmp_path / "ref.png"
+    ref_src.write_bytes(_make_image_bytes("PNG", (20, 20)))
+    captured: dict[str, Any] = {}
+
+    def fake_ok_popen(cmd: list[str], *, cwd: str | Path, env: dict[str, str]):
+        req_cwd = Path(cwd)
+        captured["cwd"] = req_cwd
+        captured["hooks_ok"] = (req_cwd / ".agents" / "hooks.json").is_file()
+        brain_dir = Path(env["HOME"]) / ".gemini" / "antigravity-cli" / "brain" / conv_id
+        brain_dir.mkdir(parents=True, exist_ok=True)
+        out_img = brain_dir / "astro_cat.jpg"
+        out_img.write_bytes(jpg_bytes)
+        captured["out_img"] = out_img
+        return _MockPopen([
+            json.dumps({"event": "init", "conversation_id": conv_id}),
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": conv_id,
+                    "step_type": "subagent",
+                    "tool_name": "invoke_subagent",
+                    "subagent_info": {"subagents": [{"type_name": "image-generator"}]},
+                },
+            }),
+            json.dumps({
+                "event": "result",
+                "result": {"conversation_id": conv_id, "status": "SUCCESS", "response": "astro_cat.jpg"},
+            }),
+        ])
+
+    cli = AntigravityCLIClient(data_dir=data_dir, binary="/mock/bin/agy")
+    with patch("bot.antigravity.cli_client.popen_isolated_session", side_effect=fake_ok_popen):
+        res = await cli.generate_image(
+            "astro cat",
+            aspect_ratio="16:9",
+            reference_images=[MediaAttachment(file_path=ref_src, mime_type="image/png")],
+            output_dir=out_dir,
+            cleanup_artifacts=True,
+        )
+    assert isinstance(res, GeneratedImageResult)
+    assert res.image_bytes == jpg_bytes
+    assert res.mime_type == "image/jpeg"
+    assert (res.width, res.height) == (64, 48)
+    assert captured["hooks_ok"] is True
+    assert not captured["cwd"].exists()
+    assert not captured["out_img"].exists()
+
+    # Policy refusal
+    with patch(
+        "bot.antigravity.cli_client.popen_isolated_session",
+        return_value=_MockPopen([
+            json.dumps({"event": "init", "conversation_id": "conv-refuse"}),
+            json.dumps({"event": "result", "result": {"conversation_id": "conv-refuse", "status": "SUCCESS", "response": "I cannot generate this due to safety policy."}}),
+        ]),
+    ):
+        with pytest.raises(ImagePolicyRefusalError):
+            await cli.generate_image("unsafe", output_dir=out_dir)
+
+    # Timeout
+    with patch(
+        "bot.antigravity.cli_client.popen_isolated_session",
+        return_value=_MockPopen([], block_until_killed=True),
+    ):
+        with pytest.raises(ImageTimeoutError):
+            await cli.generate_image("slow", timeout_seconds=0.12, output_dir=out_dir)
+
+    # Unauthorized subagent -> AntigravityNativeToolAbort
+    with patch(
+        "bot.antigravity.cli_client.popen_isolated_session",
+        return_value=_MockPopen([
+            json.dumps({"event": "init", "conversation_id": "conv-bad"}),
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-bad",
+                    "step_type": "subagent",
+                    "tool_name": "invoke_subagent",
+                    "subagent_info": {"subagents": [{"type_name": "self"}]},
+                },
+            }),
+        ]),
+    ):
+        with pytest.raises(AntigravityNativeToolAbort):
+            await cli.generate_image("bad subagent", output_dir=out_dir)
+
+    # Corrupt bytes -> ImageValidationError
+    def fake_corrupt(cmd: list[str], *, cwd: str | Path, env: dict[str, str]):
+        bdir = Path(env["HOME"]) / ".gemini" / "antigravity-cli" / "brain" / "conv-corrupt"
+        bdir.mkdir(parents=True, exist_ok=True)
+        (bdir / "bad.jpg").write_bytes(b"NOT_JPEG")
+        return _MockPopen([
+            json.dumps({"event": "init", "conversation_id": "conv-corrupt"}),
+            json.dumps({"event": "result", "result": {"conversation_id": "conv-corrupt", "status": "SUCCESS", "response": "bad.jpg"}}),
+        ])
+
+    with patch("bot.antigravity.cli_client.popen_isolated_session", side_effect=fake_corrupt):
+        with pytest.raises(ImageValidationError):
+            await cli.generate_image("corrupt", output_dir=out_dir)
+
+    # Provider routing + circuit breaker on generate_image
+    provider = AntigravityProvider(AntigravityConfig(data_dir=tmp_path / "p_img", enable_sdk=False))
+    provider._cli_client = MagicMock()
+    provider._cli_client.generate_image = AsyncMock(side_effect=AntigravityBillingError("credits balance is too low"))
+    with pytest.raises(AntigravityBillingError):
+        await provider.generate_image("planet", model="gemini-4-hydrogen")
+    assert provider.is_rate_limited("gemini-4-hydrogen") is True
+    provider._cli_client = None
+    provider.reset_cooldown()
+    with pytest.raises(ImageGenerationError):
+        await provider.generate_image("cloud")
     cli.close()

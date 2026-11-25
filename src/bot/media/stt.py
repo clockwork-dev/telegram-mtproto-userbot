@@ -411,6 +411,7 @@ class STTTranscriber:
             )
 
         tmp_dir: Optional[Path] = None
+        cleanup_in_caller = True
         wav_target = target
         try:
             if target.suffix.lower() != ".wav":
@@ -428,14 +429,18 @@ class STTTranscriber:
                 )
 
             loop = asyncio.get_running_loop()
+
+            def _run_and_cleanup() -> STTResult:
+                try:
+                    return self._transcribe_sync(wav_target, language)
+                finally:
+                    if tmp_dir is not None:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            cleanup_in_caller = False
             try:
                 return await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self._executor,
-                        self._transcribe_sync,
-                        wav_target,
-                        language,
-                    ),
+                    loop.run_in_executor(self._executor, _run_and_cleanup),
                     timeout=self.timeout_sec,
                 )
             except asyncio.TimeoutError as exc:
@@ -443,7 +448,7 @@ class STTTranscriber:
                     f"STT transcription timed out after {self.timeout_sec:.1f}s"
                 ) from exc
         finally:
-            if tmp_dir is not None:
+            if cleanup_in_caller and tmp_dir is not None:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def close(self) -> None:

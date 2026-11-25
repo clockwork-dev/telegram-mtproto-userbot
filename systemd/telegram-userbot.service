@@ -1,0 +1,21 @@
+[Unit]
+Description=Autonomous Telegram Group Userbot Agent (Antigravity SDK)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/telegram-group-bot
+EnvironmentFile=-/opt/telegram-group-bot/.env
+Environment="SSH_CONNECTION=127.0.0.1 0 127.0.0.1 22"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/telegram-group-bot/.venv/bin/telegram-group-bot run --config /opt/telegram-group-bot/config/bot.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -35,18 +35,24 @@ class ProactiveEngine:
     """Manages proactive conversation triggers, quiet hours gating, cooldowns, and cron digests."""
 
     _MAX_SENT_CRON_SLOTS = 512
+    _MAX_TRACKED_CHATS = 256
 
     def __init__(
         self,
         config_mgr: ConfigManager,
         memory_store: MemoryStore,
         antigravity_provider: Optional[Any] = None,
+        quota_manager: Optional[Any] = None,
     ) -> None:
         self.config_mgr = config_mgr
         self.memory_store = memory_store
         self.provider = antigravity_provider
-        self.humor_gen = HumorGenerator(provider=antigravity_provider)
-        self.digest_gen = NewsDigestGenerator(provider=antigravity_provider)
+        self._quota_manager = quota_manager
+        self.humor_gen = HumorGenerator(provider=antigravity_provider, quota_manager=quota_manager)
+        self.digest_gen = NewsDigestGenerator(
+            provider=antigravity_provider,
+            quota_manager=quota_manager,
+        )
         self._loop_task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._cron_cursor: Optional[datetime] = None
@@ -56,10 +62,58 @@ class ProactiveEngine:
         self._recent_fact_ids: Dict[int, deque[int]] = {}
         self._recent_friend_ids: Dict[int, deque[int]] = {}
 
+    @property
+    def quota_manager(self) -> Optional[Any]:
+        return self._quota_manager
+
+    @quota_manager.setter
+    def quota_manager(self, value: Optional[Any]) -> None:
+        self._quota_manager = value
+        if getattr(self, "humor_gen", None) is not None:
+            self.humor_gen.quota_manager = value
+        if getattr(self, "digest_gen", None) is not None:
+            self.digest_gen.quota_manager = value
+
     def _is_provider_rate_limited(self) -> bool:
-        """Return True if the configured provider has an active rate-limit/billing circuit breaker."""
+        """Return True only when all candidate proactive models are rate-limited on the provider."""
         checker = getattr(self.provider, "is_rate_limited", None)
-        return callable(checker) and checker() is True
+        if not callable(checker):
+            return False
+
+        candidates: List[str] = []
+        qm = getattr(self, "quota_manager", None)
+        if qm is not None and hasattr(qm, "select_model"):
+            try:
+                primary_model, _ = qm.select_model("proactive")
+                if primary_model:
+                    candidates.append(primary_model)
+            except Exception:
+                pass
+
+        bot_cfg = self.config_mgr.bot if getattr(self, "config_mgr", None) is not None else None
+        models_cfg = getattr(bot_cfg, "models", None) if bot_cfg is not None else None
+        for fb in getattr(models_cfg, "fallback_models", []) or []:
+            fb_model = getattr(fb, "model", None)
+            if fb_model and fb_model not in candidates:
+                candidates.append(fb_model)
+
+        if not candidates:
+            return checker() is True
+
+        for candidate in candidates:
+            try:
+                limited = checker(model=candidate) is True
+            except TypeError:
+                return checker() is True
+            if not limited:
+                return False
+        return True
+
+    @classmethod
+    def _cap_dict(cls, mapping: Dict[Any, Any]) -> None:
+        while len(mapping) > cls._MAX_TRACKED_CHATS:
+            oldest_key = next(iter(mapping))
+            mapping.pop(oldest_key, None)
 
     def _get_scheduled_interval_seconds(
         self,
@@ -85,6 +139,7 @@ class ProactiveEngine:
                 self._banter_jitter_offsets.pop(existing_key, None)
             jitter_sec = jitter_minutes * 60.0
             self._banter_jitter_offsets[key] = random.uniform(-jitter_sec, jitter_sec)
+            self._cap_dict(self._banter_jitter_offsets)
         return max(cooldown_sec, base_sec + self._banter_jitter_offsets[key])
 
     def is_in_quiet_hours(self, dt: Optional[datetime] = None) -> bool:
@@ -175,6 +230,7 @@ class ProactiveEngine:
     ) -> str:
         """Choose an autonomous proactive mode while preventing repetitive friend-roast cycles."""
         history = self._recent_modes.setdefault(chat_id, deque(maxlen=4))
+        self._cap_dict(self._recent_modes)
         has_friends = bool(getattr(getattr(self.config_mgr, "friends", None), "friends", None))
 
         if self.provider is None and trigger == "silence_breaker" and has_friends:
@@ -233,6 +289,7 @@ class ProactiveEngine:
         if mode == "light_banter" and self.config_mgr.friends.friends:
             friend_ids = list(self.config_mgr.friends.friends.keys())
             recent_friends = self._recent_friend_ids.setdefault(chat_id, deque(maxlen=3))
+            self._cap_dict(self._recent_friend_ids)
             recent_user_ids = {m.user_id for m in recent}
             matching = [fid for fid in friend_ids if fid in recent_user_ids]
             candidates = [fid for fid in (matching or friend_ids) if fid not in recent_friends]
@@ -244,6 +301,7 @@ class ProactiveEngine:
 
             query_terms = target_friend.name if target_friend else "мем"
             used_fact_ids = list(self._recent_fact_ids.setdefault(chat_id, deque(maxlen=10)))
+            self._cap_dict(self._recent_fact_ids)
             if used_fact_ids:
                 try:
                     facts = await self.memory_store.search_facts(
@@ -482,20 +540,41 @@ class ProactiveEngine:
 
     async def run_proactive_tick(
         self,
-        get_chat_states: Callable[[], Dict[int, Dict[str, float]]],
-        send_message_fn: Callable[[int, str], Any],
+        get_chat_states: Optional[Callable[[], Dict[int, Dict[str, float]]]] = None,
+        send_message_fn: Optional[Callable[[int, str], Any]] = None,
         get_target_chat_ids: Optional[Callable[[], Sequence[int]]] = None,
         now_dt: Optional[datetime] = None,
         current_time: Optional[float] = None,
         fallback_when_no_provider: bool = False,
+        *,
+        chat_states: Optional[Dict[int, Dict[str, float]]] = None,
+        send_callback: Optional[Callable[[int, str], Any]] = None,
+        target_chat_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Run one proactive evaluation tick: due cron digests first, then banter."""
+        if self.quota_manager is not None and hasattr(self.quota_manager, "should_allow_proactive"):
+            if not self.quota_manager.should_allow_proactive():
+                logger.debug("Proactive tick skipped: economy mode active")
+                return
         now_utc = self._resolve_utc_dt(now_dt=now_dt, current_time=current_time)
         now_ts = now_utc.timestamp()
 
-        chat_states = get_chat_states()
-        extra_chat_ids = list(get_target_chat_ids()) if get_target_chat_ids is not None else []
-        target_chat_ids = list(
+        resolved_states = (
+            get_chat_states()
+            if get_chat_states is not None
+            else (chat_states if chat_states is not None else {})
+        )
+        sender = send_message_fn or send_callback
+        if sender is None:
+            raise ValueError("Either send_message_fn or send_callback must be provided")
+        chat_states = resolved_states
+        send_message_fn = sender
+        extra_chat_ids = (
+            list(get_target_chat_ids())
+            if get_target_chat_ids is not None
+            else (list(target_chat_ids) if target_chat_ids is not None else [])
+        )
+        resolved_target_ids = list(
             dict.fromkeys(
                 [int(cid) for cid in extra_chat_ids if int(cid) < 0]
                 + [int(cid) for cid in chat_states.keys() if int(cid) < 0]
@@ -504,7 +583,7 @@ class ProactiveEngine:
 
         cron_sent_chats: set[int] = set()
         deliveries = await self.evaluate_cron_digests(
-            chat_ids=target_chat_ids,
+            chat_ids=resolved_target_ids,
             now_dt=now_utc,
             fallback_when_no_provider=fallback_when_no_provider,
         )

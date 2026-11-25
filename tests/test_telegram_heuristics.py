@@ -539,3 +539,23 @@ def test_unapproved_group_ignored_in_dm_mode():
     )
     assert action == ReplyAction.IGNORE
 
+
+def test_negative_group_id_never_misclassified_as_dm_when_is_private_unset():
+    """Verify negative group chat_id is never treated as a private DM even when sender is in allowed_dm_user_ids."""
+    heuristics = ReplyHeuristics()
+    event_unapproved_group = DummyEvent(
+        chat_id=-100999888777,
+        sender_id=382962362,
+        raw_text="Обычное сообщение в чужой группе",
+    )
+
+    action = heuristics.should_reply(
+        event=event_unapproved_group,
+        bot_id=123,
+        bot_names=["Джефф", "jeff"],
+        allowed_chat_ids=[-1003845062562],
+        allowed_dm_user_ids=[382962362],
+    )
+    assert action == ReplyAction.IGNORE
+
+

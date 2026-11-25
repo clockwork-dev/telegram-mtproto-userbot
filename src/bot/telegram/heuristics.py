@@ -97,6 +97,8 @@ def is_substantive_text(text: Optional[str]) -> bool:
 class ReplyHeuristics:
     """Decision engine for determining when the bot should respond to an incoming message."""
 
+    _MAX_TRACKED_CHATS = 256
+
     def __init__(
         self,
         default_max_per_hour: int = 3,
@@ -106,23 +108,48 @@ class ReplyHeuristics:
         self.default_active_window_cooldown_seconds = default_active_window_cooldown_seconds
         self._reply_timestamps: Dict[int, deque[float]] = {}
 
-    def _prune_hourly_window(self, chat_key: int, now_ts: float) -> deque[float]:
-        timestamps = self._reply_timestamps.setdefault(chat_key, deque())
+    def _sweep_reply_timestamps(self, now_ts: float) -> None:
+        cutoff = now_ts - 3600.0
+        for cid, q in list(self._reply_timestamps.items()):
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if not q:
+                self._reply_timestamps.pop(cid, None)
+        while len(self._reply_timestamps) > self._MAX_TRACKED_CHATS:
+            oldest_cid = min(
+                self._reply_timestamps,
+                key=lambda k: self._reply_timestamps[k][-1] if self._reply_timestamps[k] else 0.0,
+            )
+            self._reply_timestamps.pop(oldest_cid, None)
+
+    def _prune_hourly_window(self, chat_key: int, now_ts: float, *, create: bool = False) -> deque[float]:
+        timestamps = self._reply_timestamps.get(chat_key)
+        if timestamps is None:
+            if not create:
+                return deque()
+            if len(self._reply_timestamps) >= self._MAX_TRACKED_CHATS:
+                self._sweep_reply_timestamps(now_ts)
+            timestamps = deque()
+            self._reply_timestamps[chat_key] = timestamps
+            return timestamps
         cutoff = now_ts - 3600.0
         while timestamps and timestamps[0] <= cutoff:
             timestamps.popleft()
+        if not timestamps and not create:
+            self._reply_timestamps.pop(chat_key, None)
+            return deque()
         return timestamps
 
     def record_reply(self, chat_id: int, timestamp: Optional[float] = None) -> None:
         """Record a spontaneous/active-window reply timestamp for per-chat hourly rate limiting."""
         now_ts = timestamp if timestamp is not None else time.time()
-        timestamps = self._prune_hourly_window(int(chat_id), now_ts)
+        timestamps = self._prune_hourly_window(int(chat_id), now_ts, create=True)
         timestamps.append(now_ts)
 
     def recent_reply_count(self, chat_id: int, now: Optional[float] = None) -> int:
         """Return number of spontaneous/active-window replies recorded in the last 60 minutes."""
         now_ts = now if now is not None else time.time()
-        return len(self._prune_hourly_window(int(chat_id), now_ts))
+        return len(self._prune_hourly_window(int(chat_id), now_ts, create=False))
 
     def is_substantive_text(self, text: Optional[str]) -> bool:
         """Check whether message text contains substantive content worth spontaneous evaluation."""
@@ -147,7 +174,6 @@ class ReplyHeuristics:
         # Check Telegram entities if present
         if entities:
             for entity in entities:
-                # Telethon MessageEntityMentionName has user_id
                 entity_user_id = getattr(entity, "user_id", None)
                 if bot_id is not None and entity_user_id == bot_id:
                     return True
@@ -181,12 +207,10 @@ class ReplyHeuristics:
         if not getattr(event, "is_reply", False):
             return False
 
-        # Telethon events may have reply_to_sender_id or reply_to_msg_id
         reply_to_sender_id = getattr(event, "reply_to_sender_id", None)
         if reply_to_sender_id is not None and reply_to_sender_id == bot_id:
             return True
 
-        # Some event wrappers may have is_reply_to_bot boolean directly
         if getattr(event, "is_reply_to_bot", False):
             return True
 
@@ -215,7 +239,7 @@ class ReplyHeuristics:
         # 1. Anti-loop guard: Drop sender if bot or in ignored usernames
         sender = getattr(event, "sender", None)
         raw_sender_is_bot = getattr(event, "sender_is_bot", False)
-        sender_is_bot = (raw_sender_is_bot is True)
+        sender_is_bot = raw_sender_is_bot is True
         if not sender_is_bot and sender is not None:
             sender_is_bot = (
                 getattr(sender, "bot", False) is True
@@ -233,7 +257,9 @@ class ReplyHeuristics:
 
         ignored_usernames_set = {"hermes_kuk7yi6kfm3lcdfa_bot"}
         if ignored_sender_usernames:
-            ignored_usernames_set.update(u.lower().lstrip("@") for u in ignored_sender_usernames)
+            ignored_usernames_set.update(
+                u.lower().lstrip("@") for u in ignored_sender_usernames if u and u.strip()
+            )
 
         if sender_is_bot or (clean_username and clean_username in ignored_usernames_set):
             return ReplyAction.IGNORE
@@ -262,17 +288,26 @@ class ReplyHeuristics:
             is_priv = None
 
         if is_priv is None:
-            if allowed_dm_user_ids and (
-                (chat_id is not None and int(chat_id) in {int(u) for u in allowed_dm_user_ids})
+            chat_id_int: Optional[int] = None
+            if chat_id is not None:
+                try:
+                    chat_id_int = int(chat_id)
+                except (ValueError, TypeError):
+                    chat_id_int = None
+
+            if chat_id_int is not None and chat_id_int < 0:
+                is_priv = False
+            elif allowed_dm_user_ids and (
+                (chat_id_int is not None and chat_id_int in {int(u) for u in allowed_dm_user_ids})
                 or (sender_id is not None and int(sender_id) in {int(u) for u in allowed_dm_user_ids})
             ):
                 is_priv = True
-            elif allowed_chat_ids and chat_id is not None and int(chat_id) in {int(c) for c in allowed_chat_ids}:
+            elif allowed_chat_ids and chat_id_int is not None and chat_id_int in {int(c) for c in allowed_chat_ids}:
                 is_priv = False
             elif allowed_chat_ids is not None and len(allowed_chat_ids) == 0 and not allowed_dm_user_ids:
                 is_priv = False
-            elif chat_id is not None:
-                is_priv = int(chat_id) > 0 and bool(allowed_dm_user_ids)
+            elif chat_id_int is not None:
+                is_priv = chat_id_int > 0 and bool(allowed_dm_user_ids)
             else:
                 is_priv = False
 
@@ -346,7 +381,7 @@ class ReplyHeuristics:
                 return ReplyAction.IGNORE
             boosted_prob = max(probability, 0.45)
             if random.random() < boosted_prob:
-                timestamps.append(now_ts)
+                self.record_reply(chat_key, now_ts)
                 return ReplyAction.SPONTANEOUS_REPLY
             return ReplyAction.IGNORE
 
@@ -355,7 +390,7 @@ class ReplyHeuristics:
             return ReplyAction.IGNORE
 
         if random.random() < probability:
-            timestamps.append(now_ts)
+            self.record_reply(chat_key, now_ts)
             return ReplyAction.SPONTANEOUS_REPLY
 
         return ReplyAction.IGNORE

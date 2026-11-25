@@ -424,3 +424,96 @@ def test_deploy_remote_shell_guards():
     assert "[FATAL] Profile 'bot_api' must NEVER target '/opt/telegram-mtproto-userbot'!" in res_col3.stderr
 
 
+@pytest.mark.asyncio
+async def test_authenticate_session_qr_login_with_refresh_and_2fa(tmp_path):
+    """Verify QR login refreshes expired tokens and handles 2FA password when required."""
+    session_file = tmp_path / "qr_auth.session"
+
+    mock_qr = MagicMock()
+    mock_qr.url = "tg://login?token=test_qr_token"
+    mock_qr.recreate = AsyncMock()
+    mock_qr.wait = AsyncMock(
+        side_effect=[
+            TimeoutError(),  # wait timeout won't trigger asyncio.TimeoutError unless exact class
+        ]
+    )
+    import asyncio as _asyncio
+
+    mock_qr.wait = AsyncMock(
+        side_effect=[
+            _asyncio.TimeoutError(),
+            SessionPasswordNeededError(request=MagicMock()),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    mock_client.is_user_authorized = AsyncMock(return_value=False)
+    mock_client.qr_login = AsyncMock(return_value=mock_qr)
+    mock_client.sign_in = AsyncMock()
+
+    mock_me = MagicMock()
+    mock_me.id = 4242
+    mock_me.username = "qr_userbot"
+    mock_me.first_name = "QRBot"
+    mock_me.phone = "+380991112233"
+    mock_client.get_me = AsyncMock(return_value=mock_me)
+
+    shown_attempts = []
+
+    with patch("bot.telegram.auth.TelegramClient", return_value=mock_client):
+        res = await authenticate_session(
+            session_path=session_file,
+            api_id=123456,
+            api_hash="real_hash",
+            qr=True,
+            qr_timeout=0.01,
+            max_qr_attempts=3,
+            password_callback=lambda: "qr_2fa_pass",
+            qr_display_callback=lambda url, attempt, total: shown_attempts.append((url, attempt, total)),
+        )
+
+    assert res["authorized"] is True
+    assert res["user_id"] == 4242
+    assert len(shown_attempts) == 2
+    mock_qr.recreate.assert_awaited_once()
+    mock_client.sign_in.assert_awaited_once_with(password="qr_2fa_pass")
+
+
+def test_cli_auth_telegram_qr_flag(tmp_path, monkeypatch):
+    """Verify CLI --qr forwards qr=True to interactive_auth."""
+    import yaml
+
+    from bot.cli import main
+
+    cfg_file = tmp_path / "userbot.yaml"
+    cfg_file.write_text(
+        yaml.dump(
+            {
+                "telegram": {
+                    "api_id": 98765,
+                    "api_hash": "custom_userbot_hash",
+                    "session_path": str(tmp_path / "userbot.session"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+    monkeypatch.delenv("TELEGRAM_PHONE", raising=False)
+
+    with patch("bot.cli.load_dotenv_if_present"), patch("bot.cli.interactive_auth", return_value=True) as mock_interactive:
+        ret = main(["auth-telegram", "--config", str(cfg_file), "--qr"])
+        assert ret == 0
+        mock_interactive.assert_called_once_with(
+            session_path=str(tmp_path / "userbot.session"),
+            api_id=98765,
+            api_hash="custom_userbot_hash",
+            phone=None,
+            qr=True,
+        )
+
+
+

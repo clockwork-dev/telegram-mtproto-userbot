@@ -22,36 +22,79 @@ class AudioProcessingError(Exception):
 
 
 def resolve_ffmpeg_path(custom_path: Optional[str] = None) -> str:
-    """Resolve FFmpeg executable path via config, static path, or system PATH."""
-    if custom_path and os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
-        return str(Path(custom_path).resolve())
-
-    if os.path.isfile(DEFAULT_STATIC_FFMPEG) and os.access(DEFAULT_STATIC_FFMPEG, os.X_OK):
-        return DEFAULT_STATIC_FFMPEG
-
-    for candidate in Path.home().glob(".hermes/tools/ffmpeg*/bin/ffmpeg"):
-        if os.path.isfile(str(candidate)) and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
+    """Resolve FFmpeg executable path via config, system PATH, standard paths, or static fallback."""
+    if custom_path:
+        if os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
+            return str(Path(custom_path).resolve())
+        logger.debug("Configured ffmpeg_path '%s' not executable; trying fallback paths.", custom_path)
 
     system_which = shutil.which("ffmpeg")
     if system_which:
         return system_which
+
+    for candidate in ("/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    if os.path.isfile(DEFAULT_STATIC_FFMPEG) and os.access(DEFAULT_STATIC_FFMPEG, os.X_OK):
+        return DEFAULT_STATIC_FFMPEG
+
+    try:
+        for candidate in Path.home().glob(".hermes/tools/ffmpeg*/bin/ffmpeg"):
+            if os.path.isfile(str(candidate)) and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+    except OSError:
+        pass
 
     raise FileNotFoundError(
         "FFmpeg binary not found. Please configure a valid ffmpeg_path or install ffmpeg."
     )
 
 
-async def _run_ffmpeg_command(cmd: list[str]) -> None:
-    """Run an FFmpeg command asynchronously via asyncio.subprocess."""
+DEFAULT_FFMPEG_TIMEOUT_SECONDS = 60.0
+
+
+async def _run_ffmpeg_command(
+    cmd: list[str],
+    timeout_seconds: float = DEFAULT_FFMPEG_TIMEOUT_SECONDS,
+) -> None:
+    """Run an FFmpeg command asynchronously with timeout and subprocess cleanup."""
     logger.debug("Executing FFmpeg command: %s", " ".join(cmd))
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except asyncio.TimeoutError as exc:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        raise AudioProcessingError(
+            f"FFmpeg command timed out after {timeout_seconds:.1f}s"
+        ) from exc
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        raise
     except Exception as e:
         raise AudioProcessingError(f"Failed to start FFmpeg process: {e}") from e
 

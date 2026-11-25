@@ -204,15 +204,15 @@ async def test_userbot_send_voice_bot_api_mode_routing(tmp_path):
     )
 
     assert res["result"]["message_id"] == 778
-    mock_bot_api.send_voice.assert_awaited_once_with(
-        chat_id=-100123,
-        voice_path=voice_file.resolve(),
-        caption=None,
-        reply_to_msg_id=42,
-        duration=4.0,
-        simulate_typing=False,
-        timeout=30.0,
-    )
+    mock_bot_api.send_voice.assert_awaited_once()
+    routed_kwargs = mock_bot_api.send_voice.await_args.kwargs
+    assert routed_kwargs["chat_id"] == -100123
+    assert Path(routed_kwargs["voice_path"]).resolve() == voice_file.resolve()
+    assert routed_kwargs["caption"] is None
+    assert routed_kwargs["reply_to_msg_id"] == 42
+    assert routed_kwargs["duration"] == 4.0
+    assert routed_kwargs["simulate_typing"] is False
+    assert routed_kwargs["timeout"] == 30.0
     mock_raw_client.send_file.assert_not_awaited()
 
 

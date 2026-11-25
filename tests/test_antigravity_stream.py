@@ -1,112 +1,62 @@
-"""Tests for Antigravity NDJSON stream parsing, thinking extraction, and tool interception."""
+"""Tests for Antigravity NDJSON stream parsing, ToolProfile gating, and secret-free abort diagnostics."""
 
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
 
 import pytest
 
-from bot.antigravity.errors import AntigravityNativeToolAbort
+from bot.antigravity.errors import AntigravityNativeToolAbort, ErrorCategory, classify_error
 from bot.antigravity.stream import (
+    ALWAYS_FORBIDDEN_TOOLS,
+    CHAT_ALLOWED_TOOLS,
+    IMAGE_ALLOWED_SUBAGENT_TYPES,
+    OPS_ALLOWED_TOOLS,
+    SELF_DEV_ALLOWED_TOOLS,
     AntigravityStreamParser,
     _longest_tag_prefix_tail,
+    is_allowed_image_subagent_step,
     parse_ndjson_stream,
+    resolve_allowed_tools,
 )
 
 
-def test_longest_tag_prefix_tail():
+def test_tool_profile_invariants_and_always_forbidden():
+    assert CHAT_ALLOWED_TOOLS == frozenset({"search_web", "read_url_content"})
+    assert len(OPS_ALLOWED_TOOLS) == 23
+    assert SELF_DEV_ALLOWED_TOOLS == OPS_ALLOWED_TOOLS
+    assert IMAGE_ALLOWED_SUBAGENT_TYPES == frozenset({"image-generator"})
+    for forbidden in (
+        "browser_subagent",
+        "open_browser_url",
+        "call_mcp_tool",
+        "swarm",
+        "generate_image",
+        "ask_question",
+        "ask_permission",
+        "ask_custom_permission",
+    ):
+        assert forbidden in ALWAYS_FORBIDDEN_TOOLS
+    assert resolve_allowed_tools("image") == frozenset()
+    assert "swarm" not in resolve_allowed_tools("ops", allowed_tools=frozenset({"swarm", "read_file"}))
+    with pytest.raises(ValueError):
+        resolve_allowed_tools("invalid_profile")  # type: ignore[arg-type]
+
+
+def test_longest_tag_prefix_tail_and_split_chunks():
     tag = "<tool_call>"
     assert _longest_tag_prefix_tail("hello <tool_c", tag) == len("<tool_c")
-    assert _longest_tag_prefix_tail("hello <tool_", tag) == len("<tool_")
-    assert _longest_tag_prefix_tail("hello <", tag) == len("<")
-    assert _longest_tag_prefix_tail("hello <tool_call>", tag) == 0  # full tag, not strict prefix
-    assert _longest_tag_prefix_tail("hello world", tag) == 0
+    assert _longest_tag_prefix_tail("hello <tool_call>", tag) == 0
 
-
-def test_parse_init_event():
     parser = AntigravityStreamParser()
-    line = json.dumps({"event": "init", "conversation_id": "conv_12345"})
-    chunks = parser.feed_line(line)
-
-    assert len(chunks) == 1
-    assert chunks[0].conversation_id == "conv_12345"
-    assert parser.conversation_id == "conv_12345"
-
-
-def test_parse_step_update_text_and_thinking():
-    parser = AntigravityStreamParser()
-
-    # Step update with thinking
-    line1 = json.dumps({
-        "event": "step_update",
-        "step_update": {"thinking_delta": "Thinking about the question..."},
-    })
-    chunks1 = parser.feed_line(line1)
-    assert len(chunks1) == 1
-    assert chunks1[0].thinking == "Thinking about the question..."
-
-    # Step update with text
-    line2 = json.dumps({
-        "event": "step_update",
-        "step_update": {"text_delta": "Hello world!"},
-    })
-    chunks2 = parser.feed_line(line2)
-    assert len(chunks2) == 1
-    assert chunks2[0].text == "Hello world!"
-
-
-def test_native_tool_interception_step_update():
-    interception_called = False
-
-    def on_intercept():
-        nonlocal interception_called
-        interception_called = True
-
-    parser = AntigravityStreamParser(on_native_tool_intercept=on_intercept)
-    line = json.dumps({
-        "event": "step_update",
-        "step_update": {"step_type": "tool", "tool_name": "bash"},
-    })
-
-    with pytest.raises(AntigravityNativeToolAbort):
-        parser.feed_line(line)
-
-    assert interception_called is True
-    assert parser.native_tool_intercepted is True
-
-
-def test_native_tool_interception_assistant():
-    interception_called = False
-
-    def on_intercept():
-        nonlocal interception_called
-        interception_called = True
-
-    parser = AntigravityStreamParser(on_native_tool_intercept=on_intercept)
-    line = json.dumps({
-        "event": "assistant",
-        "message": {"step_type": "tool"},
-    })
-
-    with pytest.raises(AntigravityNativeToolAbort):
-        parser.feed_line(line)
-
-    assert interception_called is True
-
-
-def test_safe_tag_prefix_buffering_split_across_chunks():
-    parser = AntigravityStreamParser()
-
-    # Chunk 1 ends with partial tag: "<tool_c"
     chunks1 = parser.feed_line(json.dumps({
         "event": "step_update",
         "step_update": {"text_delta": "Prefix text: <tool_c"},
     }))
-    # "Prefix text: " should be emitted, but "<tool_c" held in buffer!
-    assert len(chunks1) == 1
-    assert chunks1[0].text == "Prefix text: "
+    assert len(chunks1) == 1 and chunks1[0].text == "Prefix text: "
 
-    # Chunk 2 completes the tag and includes payload
     chunks2 = parser.feed_line(json.dumps({
         "event": "step_update",
         "step_update": {
@@ -118,88 +68,13 @@ def test_safe_tag_prefix_buffering_split_across_chunks():
     assert chunks2[0].tool_calls[0]["function"]["name"] == "check_status"
 
 
-def test_parse_error_event():
-    parser = AntigravityStreamParser()
-    line = json.dumps({"event": "error", "error": "Model capacity exhausted"})
-    with pytest.raises(RuntimeError) as exc_info:
-        parser.feed_line(line)
-    assert "Model capacity exhausted" in str(exc_info.value)
-
-
-def test_result_event_and_finish_usage():
-    lines = [
-        json.dumps({"event": "init", "conversation_id": "conv_99"}),
-        json.dumps({
-            "event": "step_update",
-            "step_update": {
-                "text_delta": "Generated response content.",
-                "usage": {
-                    "input_tokens": 100,
-                    "output_tokens": 25,
-                    "reasoning_tokens": 10,
-                    "cache_read_tokens": 5,
-                },
-            },
-        }),
-        json.dumps({
-            "event": "result",
-            "result": {"status": "SUCCESS", "stop_reason": "end_turn"},
-        }),
-    ]
-
-    all_chunks = list(parse_ndjson_stream(iter(lines)))
-    assert any(c.text == "Generated response content." for c in all_chunks)
-
-    final_chunks = [c for c in all_chunks if c.is_final]
-    assert len(final_chunks) == 1
-    final = final_chunks[0]
-    assert final.finish_reason == "stop"
-    assert final.conversation_id == "conv_99"
-    assert final.usage is not None
-    assert final.usage.prompt_tokens == 105
-    assert final.usage.completion_tokens == 35
-
-
-def test_search_web_and_read_url_content_allowed_while_run_command_aborted():
-    """Verify search_web and read_url_content tool calls are allowed while run_command is aborted."""
-    intercept_count = 0
-
-    def on_intercept():
-        nonlocal intercept_count
-        intercept_count += 1
-
-    parser = AntigravityStreamParser(on_native_tool_intercept=on_intercept)
-
-    # Multi-step turn with search_web and read_url_content (matching live agy stream-json output)
+def test_result_event_and_chat_allowed_vs_forbidden_tools():
     events = [
         json.dumps({"event": "init", "conversation_id": "conv_search_1"}),
         json.dumps({
             "event": "step_update",
             "step_update": {
                 "conversation_id": "conv_search_1",
-                "step_index": 1,
-                "state": "DONE",
-                "step_type": "agent_response",
-                "usage": {"input_tokens": 1000, "output_tokens": 50, "thinking_tokens": 30},
-            },
-        }),
-        json.dumps({
-            "event": "step_update",
-            "step_update": {
-                "conversation_id": "conv_search_1",
-                "step_index": 2,
-                "state": "ACTIVE",
-                "step_type": "tool",
-                "tool_name": "search_web",
-                "tool_info": {"name": "search_web", "parameters": {"query": "погода в Сумах"}},
-            },
-        }),
-        json.dumps({
-            "event": "step_update",
-            "step_update": {
-                "conversation_id": "conv_search_1",
-                "step_index": 2,
-                "state": "DONE",
                 "step_type": "tool",
                 "tool_name": "search_web",
             },
@@ -208,31 +83,16 @@ def test_search_web_and_read_url_content_allowed_while_run_command_aborted():
             "event": "step_update",
             "step_update": {
                 "conversation_id": "conv_search_1",
-                "step_index": 3,
-                "state": "DONE",
                 "step_type": "tool",
                 "tool_name": "read_url_content",
-                "tool_info": {"name": "read_url_content", "parameters": {"url": "https://example.com"}},
             },
         }),
         json.dumps({
             "event": "step_update",
             "step_update": {
                 "conversation_id": "conv_search_1",
-                "step_index": 4,
-                "state": "ACTIVE",
                 "step_type": "agent_response",
-                "text_delta": "В Сумах сегодня ",
-            },
-        }),
-        json.dumps({
-            "event": "step_update",
-            "step_update": {
-                "conversation_id": "conv_search_1",
-                "step_index": 4,
-                "state": "DONE",
-                "step_type": "agent_response",
-                "text_delta": "+8 °C и облачно.",
+                "text_delta": "В Сумах +8 °C.",
             },
         }),
         json.dumps({
@@ -240,31 +100,21 @@ def test_search_web_and_read_url_content_allowed_while_run_command_aborted():
             "result": {
                 "conversation_id": "conv_search_1",
                 "status": "SUCCESS",
-                "response": "В Сумах сегодня +8 °C и облачно.",
                 "usage": {"input_tokens": 2000, "output_tokens": 90, "thinking_tokens": 45, "cache_read_tokens": 800},
             },
         }),
     ]
-
-    emitted_chunks = []
-    for line in events:
-        emitted_chunks.extend(parser.feed_line(line))
-    emitted_chunks.extend(parser.finish())
-
-    assert intercept_count == 0
-    assert parser.native_tool_intercepted is False
-    combined_text = "".join(c.text for c in emitted_chunks if c.text)
-    assert combined_text == "В Сумах сегодня +8 °C и облачно."
-
-    final = [c for c in emitted_chunks if c.is_final][0]
+    all_chunks = list(parse_ndjson_stream(iter(events)))
+    assert "".join(c.text for c in all_chunks if c.text) == "В Сумах +8 °C."
+    final = [c for c in all_chunks if c.is_final][0]
     assert final.usage is not None
     assert final.usage.prompt_tokens == 2800
     assert final.usage.completion_tokens == 135
     assert final.usage.reasoning_tokens == 45
+    assert final.usage.cache_read_tokens == 800
 
-    # Dangerous local tools (run_command, write_to_file, view_file) must be strictly aborted
     for forbidden_tool in ("run_command", "write_to_file", "view_file", "list_dir"):
-        p_forbid = AntigravityStreamParser(on_native_tool_intercept=on_intercept)
+        p_forbid = AntigravityStreamParser(tool_profile="chat")
         with pytest.raises(AntigravityNativeToolAbort):
             p_forbid.feed_line(
                 json.dumps({
@@ -272,5 +122,81 @@ def test_search_web_and_read_url_content_allowed_while_run_command_aborted():
                     "step_update": {"step_type": "tool", "tool_name": forbidden_tool},
                 })
             )
-        assert p_forbid.native_tool_intercepted is True
-    assert intercept_count == 4
+
+
+@pytest.mark.parametrize("subagent_type", ["image-generator", "self", "research"])
+def test_stream_parser_blocks_subagent_in_chat_and_allows_ops(subagent_type: str):
+    event = {
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "conv-123",
+            "step_type": "subagent",
+            "tool_name": "invoke_subagent",
+            "subagent_info": {"subagents": [{"type_name": subagent_type}]},
+        },
+    }
+    p_chat = AntigravityStreamParser(tool_profile="chat")
+    with pytest.raises(AntigravityNativeToolAbort):
+        p_chat.feed_line(json.dumps(event))
+
+    p_ops = AntigravityStreamParser(tool_profile="ops")
+    p_ops.feed_line(json.dumps(event))
+    assert p_ops.native_tool_intercepted is False
+
+
+@pytest.mark.parametrize(
+    "bad_step",
+    [
+        {"step_type": "subagent", "tool_name": "invoke_subagent", "subagent_info": {"subagents": [{"type_name": "self"}]}},
+        {"step_type": "subagent", "tool_name": "invoke_subagent", "subagent_info": {"subagents": [{"type_name": "image-generator"}, {"type_name": "self"}]}},
+        {"step_type": "subagent", "tool_name": "invoke_subagent", "subagent_info": {"subagents": []}},
+        {"step_type": "subagent", "tool_name": "browser_subagent", "subagent_info": {"subagents": [{"type_name": "image-generator"}]}},
+        {"step_type": "tool", "tool_name": "run_command"},
+        {"step_type": "tool", "tool_name": "read_file"},
+        {"step_type": "tool", "tool_name": "search_web"},
+        {"step_type": "tool", "tool_name": "generate_image"},
+        {"step_type": "tool"},
+    ],
+)
+def test_image_profile_allows_only_image_generator_and_aborts_unsafe(bad_step: dict[str, Any]):
+    ok_step = {
+        "step_type": "subagent",
+        "tool_name": "invoke_subagent",
+        "subagent_info": {"subagents": [{"type_name": "Image-Generator"}]},
+    }
+    assert is_allowed_image_subagent_step(ok_step) is True
+    p_ok = AntigravityStreamParser(tool_profile="image")
+    p_ok.feed_line(json.dumps({"event": "step_update", "step_update": ok_step}))
+    assert p_ok.native_tool_intercepted is False
+
+    p_bad = AntigravityStreamParser(tool_profile="image")
+    with pytest.raises(AntigravityNativeToolAbort):
+        p_bad.feed_line(json.dumps({"event": "step_update", "step_update": bad_step}))
+
+
+def test_abort_diagnostics_secret_free_and_safe_non_tool_steps(caplog: pytest.LogCaptureFixture) -> None:
+    parser = AntigravityStreamParser(tool_profile="chat")
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        parser.feed_line(json.dumps({"event": "step_update", "step_update": {"name": "step_one", "text_delta": "Hi"}}))
+    assert parser.native_tool_intercepted is False
+    assert caplog.records == []
+
+    secret_tok = "sk-proj-SUPERSECRET1234567890"
+    secret_cmd = "cat /opt/telegram-mtproto-userbot/.env"
+    p_abort = AntigravityStreamParser(tool_profile="chat")
+    with pytest.raises(AntigravityNativeToolAbort) as exc_info:
+        p_abort.feed_line(
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "tool_name": f"bash {secret_tok}",
+                    "tool_info": {"parameters": {"command": secret_cmd}},
+                },
+            })
+        )
+    msg = str(exc_info.value)
+    assert "tool=<redacted>" in msg
+    assert secret_tok not in msg
+    assert secret_cmd not in msg
+    assert classify_error(msg).category == ErrorCategory.NATIVE_TOOL_ABORT
