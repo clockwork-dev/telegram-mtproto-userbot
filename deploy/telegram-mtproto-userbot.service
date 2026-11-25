@@ -6,6 +6,8 @@ ConditionPathExists=/opt/telegram-mtproto-userbot/data/session/userbot.session
 
 [Service]
 Type=simple
+User=botops
+Group=botops
 WorkingDirectory=/opt/telegram-mtproto-userbot
 EnvironmentFile=-/opt/telegram-mtproto-userbot/.env
 Environment="SSH_CONNECTION=127.0.0.1 0 127.0.0.1 22"

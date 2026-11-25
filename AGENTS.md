@@ -1,7 +1,7 @@
 # AGENTS.md — AI Assistant Guide (`telegram-mtproto-userbot`, MTProto / Telethon mode)
 
 ## 1. Repository Scope
-This repository contains the **Telegram MTProto Userbot agent** (`mode: "userbot"` via Telethon, persona **«Потужнич»** / `Potuzhnych`), deployed on production servers under `/opt/telegram-mtproto-userbot` (`telegram-mtproto-userbot.service`).
+This repository contains the **Telegram MTProto Userbot agent** (`mode: "userbot"` via Telethon, persona **«Потужнич»** / `Potuzhnych`), deployed on production servers under `/opt/telegram-mtproto-userbot` (`telegram-mtproto-userbot.service`, `User=botops`, `Group=botops`).
 
 **Strictly out of scope for this repo:**
 - The sibling **classic Bot API agent** (`telegram-group-bot`) lives in a separate repository and runs isolated under `/opt/telegram-group-bot` (`telegram-userbot.service`). Never modify, overwrite, or couple code/scripts to `/opt/telegram-group-bot`.

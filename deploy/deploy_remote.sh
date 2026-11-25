@@ -213,6 +213,11 @@ echo "==> Setting up environment and executing verification on ${REMOTE_HOST} ..
   echo '==> Running dry-run smoke test for ${CONFIG_FILE} ...'
   .venv/bin/telegram-group-bot run --config '${CONFIG_FILE}' --dry-run
 
+  if [ "$(id -u)" -eq 0 ] && id botops >/dev/null 2>&1; then
+    echo '==> Ensuring botops:botops ownership on ${REMOTE_DIR} ...'
+    chown -R botops:botops '${REMOTE_DIR}'
+  fi
+
   echo '==> Installing service unit /etc/systemd/system/${SERVICE_NAME} ...'
   cp '${SERVICE_SRC}' '/etc/systemd/system/${SERVICE_NAME}'
   systemctl daemon-reload

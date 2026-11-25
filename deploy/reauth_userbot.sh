@@ -388,6 +388,11 @@ if [[ -f "${MEM_DB}" ]]; then
   fi
 fi
 
+# Ensure botops owns all updated session, DB, config, and OAuth files when run as root
+if [[ "$(id -u)" -eq 0 ]] && id botops >/dev/null 2>&1; then
+  chown -R botops:botops "${REPO_ROOT}"
+fi
+
 # 5. Start systemd service
 echo ""
 echo "--- Шаг 5. Запуск сервиса ---"
