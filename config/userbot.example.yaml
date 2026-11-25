@@ -21,6 +21,10 @@ telegram:
   # Anti-loop prevention: strictly ignore messages from specific bots
   ignored_sender_usernames: []
     # - "other_bot_username"
+  ignored_sender_ids: []
+    # - 1234567890  # Sibling bot user_id
+  # Require reply-to-userbot or explicit name mention on group slash commands (/imagine, /quota, /ops)
+  group_slash_commands_require_target: true
 
 behavior:
   # Distinct persona names to avoid cross-bot confusion with піструнькиня / Джефф
@@ -37,9 +41,10 @@ behavior:
   spontaneous_replies:
     enabled: true
     min_interval_seconds: 300
-    probability: 0.15
-    max_per_hour: 3
-    active_conversation_window_seconds: 60
+    probability: 0.08
+    max_per_hour: 2
+    active_conversation_window_seconds: 45
+    active_window_probability: 0.22
 
 quiet_hours:
   enabled: true
@@ -76,8 +81,9 @@ media:
 memory:
   db_path: "data/memory.sqlite"
   short_term_limit: 30
-  compaction_threshold: 100
-  compaction_batch_size: 50
+  compaction_threshold: 220
+  compaction_batch_size: 140
+  compaction_min_substantive: 12
   backup:
     enabled: true
     backup_dir: "data/backups"

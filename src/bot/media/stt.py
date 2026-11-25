@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import array
 import asyncio
+import gc
 import logging
 import shutil
 import tempfile
 import threading
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,6 +44,7 @@ DEFAULT_MAX_DURATION_SEC = 120
 DEFAULT_TIMEOUT_SEC = 45.0
 DEFAULT_ALLOWED_LANGUAGES = ("ru", "uk")
 DEFAULT_MODEL_DIR = "data/models/whisper"
+DEFAULT_IDLE_UNLOAD_SEC = 600.0
 WHISPER_SAMPLE_RATE = 16000
 
 _UNSET = object()
@@ -204,6 +207,7 @@ class STTTranscriber:
         timeout_sec: Optional[float] = None,
         allowed_languages: Optional[Sequence[str]] = None,
         model_dir: Any = _UNSET,
+        idle_unload_seconds: Optional[float] = None,
         ffmpeg_path: Optional[str] = None,
         vad_filter: bool = True,
         beam_size: int = 5,
@@ -251,6 +255,13 @@ class STTTranscriber:
             cfg_dir = getattr(config, "model_dir", DEFAULT_MODEL_DIR)
             self.model_dir = str(cfg_dir) if cfg_dir else None
 
+        raw_idle = (
+            idle_unload_seconds
+            if idle_unload_seconds is not None
+            else getattr(config, "idle_unload_seconds", DEFAULT_IDLE_UNLOAD_SEC)
+        )
+        self.idle_unload_seconds: float = max(0.0, float(raw_idle or 0.0))
+
         self.ffmpeg_path = ffmpeg_path
         self.vad_filter = vad_filter
         self.beam_size = beam_size
@@ -259,8 +270,55 @@ class STTTranscriber:
 
         self._model: Any = None
         self._model_lock = threading.Lock()
+        self._active_jobs: int = 0
+        self._last_used_mono: float = 0.0
+        self._idle_timer: Optional[threading.Timer] = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-whisper")
         self._warned_unavailable = False
+
+    def _cancel_idle_timer_locked(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _schedule_idle_unload_locked(self) -> None:
+        self._cancel_idle_timer_locked()
+        if self._model is None or self.idle_unload_seconds <= 0.0 or self._active_jobs > 0:
+            return
+        timer = threading.Timer(self.idle_unload_seconds, self._on_idle_unload_timer)
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
+    def _on_idle_unload_timer(self) -> None:
+        unloaded = False
+        with self._model_lock:
+            self._idle_timer = None
+            if self._model is None or self._active_jobs > 0 or self.idle_unload_seconds <= 0.0:
+                return
+            elapsed = time.monotonic() - self._last_used_mono
+            if elapsed + 0.05 < self.idle_unload_seconds:
+                self._schedule_idle_unload_locked()
+                return
+            self._model = None
+            unloaded = True
+        if unloaded:
+            gc.collect()
+            logger.info(
+                "Unloaded idle faster-whisper model (size=%s) after %.0fs of inactivity.",
+                self.model_size,
+                self.idle_unload_seconds,
+            )
+
+    def unload_model(self) -> bool:
+        """Explicitly release cached WhisperModel from RAM."""
+        with self._model_lock:
+            self._cancel_idle_timer_locked()
+            if self._model is None or self._active_jobs > 0:
+                return False
+            self._model = None
+        gc.collect()
+        return True
 
     def _get_or_load_model(self) -> Any:
         """Lazily load and cache the WhisperModel in a thread-safe manner."""
@@ -337,53 +395,62 @@ class STTTranscriber:
         language: Optional[str] = None,
     ) -> STTResult:
         """Synchronous transcription workflow executed inside the worker thread."""
-        model = self._get_or_load_model()
-        audio_array, duration = load_wav_audio(wav_path)
+        with self._model_lock:
+            self._active_jobs += 1
+            self._cancel_idle_timer_locked()
+        try:
+            model = self._get_or_load_model()
+            audio_array, duration = load_wav_audio(wav_path)
 
-        forced_lang: Optional[str] = None
-        if language is not None:
-            forced_lang = language.strip().lower()
-            if self.allowed_languages and forced_lang not in self.allowed_languages:
-                raise STTLanguageError(
-                    f"Requested language '{forced_lang}' is not in allowed_languages={list(self.allowed_languages)}"
-                )
-        elif len(self.allowed_languages) == 1:
-            forced_lang = self.allowed_languages[0]
+            forced_lang: Optional[str] = None
+            if language is not None:
+                forced_lang = language.strip().lower()
+                if self.allowed_languages and forced_lang not in self.allowed_languages:
+                    raise STTLanguageError(
+                        f"Requested language '{forced_lang}' is not in allowed_languages={list(self.allowed_languages)}"
+                    )
+            elif len(self.allowed_languages) == 1:
+                forced_lang = self.allowed_languages[0]
 
-        text, info = self._run_model_transcribe(model, audio_array, language=forced_lang)
+            text, info = self._run_model_transcribe(model, audio_array, language=forced_lang)
 
-        detected_lang = (
-            str(getattr(info, "language", "") or forced_lang or "").strip().lower()
-        )
-        raw_prob = getattr(info, "language_probability", None)
-        lang_prob: Optional[float] = float(raw_prob) if raw_prob is not None else None
-
-        if forced_lang is None and self.allowed_languages and detected_lang not in self.allowed_languages:
-            if self.strict_language_filter:
-                raise STTLanguageError(
-                    f"Detected language '{detected_lang}' is not in allowed_languages={list(self.allowed_languages)}"
-                )
-
-            best_lang, best_prob = _select_best_allowed_language(self.allowed_languages, info)
-            logger.debug(
-                "STT detected disallowed language '%s' (p=%s); retrying with '%s'",
-                detected_lang,
-                lang_prob,
-                best_lang,
+            detected_lang = (
+                str(getattr(info, "language", "") or forced_lang or "").strip().lower()
             )
-            text, retry_info = self._run_model_transcribe(model, audio_array, language=best_lang)
-            detected_lang = best_lang
-            retry_prob = getattr(retry_info, "language_probability", None)
-            lang_prob = best_prob if best_prob is not None else (
-                float(retry_prob) if retry_prob is not None else None
-            )
+            raw_prob = getattr(info, "language_probability", None)
+            lang_prob: Optional[float] = float(raw_prob) if raw_prob is not None else None
 
-        return STTResult(
-            text=text,
-            language=detected_lang,
-            duration=round(duration, 3),
-            language_probability=round(lang_prob, 4) if lang_prob is not None else None,
-        )
+            if forced_lang is None and self.allowed_languages and detected_lang not in self.allowed_languages:
+                if self.strict_language_filter:
+                    raise STTLanguageError(
+                        f"Detected language '{detected_lang}' is not in allowed_languages={list(self.allowed_languages)}"
+                    )
+
+                best_lang, best_prob = _select_best_allowed_language(self.allowed_languages, info)
+                logger.debug(
+                    "STT detected disallowed language '%s' (p=%s); retrying with '%s'",
+                    detected_lang,
+                    lang_prob,
+                    best_lang,
+                )
+                text, retry_info = self._run_model_transcribe(model, audio_array, language=best_lang)
+                detected_lang = best_lang
+                retry_prob = getattr(retry_info, "language_probability", None)
+                lang_prob = best_prob if best_prob is not None else (
+                    float(retry_prob) if retry_prob is not None else None
+                )
+
+            return STTResult(
+                text=text,
+                language=detected_lang,
+                duration=round(duration, 3),
+                language_probability=round(lang_prob, 4) if lang_prob is not None else None,
+            )
+        finally:
+            with self._model_lock:
+                self._active_jobs = max(0, self._active_jobs - 1)
+                self._last_used_mono = time.monotonic()
+                self._schedule_idle_unload_locked()
 
     async def transcribe(
         self,
@@ -452,5 +519,8 @@ class STTTranscriber:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def close(self) -> None:
-        """Shut down the underlying transcription worker thread."""
+        """Shut down the underlying transcription worker thread and release cached model."""
+        with self._model_lock:
+            self._cancel_idle_timer_locked()
+            self._model = None
         self._executor.shutdown(wait=False)

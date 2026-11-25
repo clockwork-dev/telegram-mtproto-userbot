@@ -107,6 +107,7 @@ class ReplyHeuristics:
         self.default_max_per_hour = default_max_per_hour
         self.default_active_window_cooldown_seconds = default_active_window_cooldown_seconds
         self._reply_timestamps: Dict[int, deque[float]] = {}
+        self._last_spontaneous_attempt: Dict[int, float] = {}
 
     def _sweep_reply_timestamps(self, now_ts: float) -> None:
         cutoff = now_ts - 3600.0
@@ -121,6 +122,15 @@ class ReplyHeuristics:
                 key=lambda k: self._reply_timestamps[k][-1] if self._reply_timestamps[k] else 0.0,
             )
             self._reply_timestamps.pop(oldest_cid, None)
+        for cid, ts in list(self._last_spontaneous_attempt.items()):
+            if ts <= cutoff:
+                self._last_spontaneous_attempt.pop(cid, None)
+        while len(self._last_spontaneous_attempt) > self._MAX_TRACKED_CHATS:
+            oldest_attempt_cid = min(
+                self._last_spontaneous_attempt,
+                key=lambda k: self._last_spontaneous_attempt[k],
+            )
+            self._last_spontaneous_attempt.pop(oldest_attempt_cid, None)
 
     def _prune_hourly_window(self, chat_key: int, now_ts: float, *, create: bool = False) -> deque[float]:
         timestamps = self._reply_timestamps.get(chat_key)
@@ -231,12 +241,14 @@ class ReplyHeuristics:
         active_conversation_window_seconds: float = 90.0,
         max_per_hour: Optional[int] = None,
         active_window_cooldown_seconds: Optional[float] = None,
+        active_window_probability: Optional[float] = None,
         now: Optional[float] = None,
         allowed_dm_user_ids: Optional[List[int]] = None,
         ignored_sender_usernames: Optional[List[str]] = None,
+        ignored_sender_ids: Optional[List[int]] = None,
     ) -> ReplyAction:
         """Evaluate incoming message event and decide on appropriate reply action."""
-        # 1. Anti-loop guard: Drop sender if bot or in ignored usernames
+        # 1. Anti-loop guard: Drop sender if bot or in ignored usernames/IDs
         sender = getattr(event, "sender", None)
         raw_sender_is_bot = getattr(event, "sender_is_bot", False)
         sender_is_bot = raw_sender_is_bot is True
@@ -264,13 +276,20 @@ class ReplyHeuristics:
         if sender_is_bot or (clean_username and clean_username in ignored_usernames_set):
             return ReplyAction.IGNORE
 
-        # 2. Self-message loop suppression
+        # 2. Self-message & ignored-ID loop suppression
         if getattr(event, "out", False):
             return ReplyAction.IGNORE
 
         sender_id = getattr(event, "sender_id", None)
-        if sender_id is not None and bot_id is not None and sender_id == bot_id:
-            return ReplyAction.IGNORE
+        if sender_id is not None:
+            if bot_id is not None and sender_id == bot_id:
+                return ReplyAction.IGNORE
+            if ignored_sender_ids:
+                try:
+                    if int(sender_id) in {int(uid) for uid in ignored_sender_ids}:
+                        return ReplyAction.IGNORE
+                except (TypeError, ValueError):
+                    pass
 
         # 3. Strict DM whitelist vs Group whitelist
         chat_id = getattr(event, "chat_id", None)
@@ -379,8 +398,16 @@ class ReplyHeuristics:
         if 0.0 < time_since_last_bot_msg <= active_conversation_window_seconds:
             if time_since_last_bot_msg < effective_active_cooldown:
                 return ReplyAction.IGNORE
-            boosted_prob = max(probability, 0.45)
+            last_attempt = self._last_spontaneous_attempt.get(chat_key)
+            if last_attempt is not None and 0.0 <= (now_ts - last_attempt) < effective_active_cooldown:
+                return ReplyAction.IGNORE
+            boosted_prob = (
+                float(active_window_probability)
+                if active_window_probability is not None
+                else max(probability, 0.45)
+            )
             if random.random() < boosted_prob:
+                self._last_spontaneous_attempt[chat_key] = now_ts
                 self.record_reply(chat_key, now_ts)
                 return ReplyAction.SPONTANEOUS_REPLY
             return ReplyAction.IGNORE
@@ -390,6 +417,7 @@ class ReplyHeuristics:
             return ReplyAction.IGNORE
 
         if random.random() < probability:
+            self._last_spontaneous_attempt[chat_key] = now_ts
             self.record_reply(chat_key, now_ts)
             return ReplyAction.SPONTANEOUS_REPLY
 

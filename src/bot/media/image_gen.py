@@ -114,9 +114,9 @@ def parse_imagine_command(
         return ImageCommandParseResult(is_command=False)
 
     target_bot = match.group(1)
-    if target_bot and bot_username:
-        expected = bot_username.strip().lstrip("@").lower()
-        if expected and target_bot.strip().lower() != expected:
+    if target_bot:
+        expected = (bot_username or "").strip().lstrip("@").lower()
+        if not expected or target_bot.strip().lower() != expected:
             return ImageCommandParseResult(
                 is_command=False,
                 addressed_to_other_bot=True,

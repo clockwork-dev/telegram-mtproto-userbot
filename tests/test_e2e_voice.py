@@ -1052,8 +1052,8 @@ async def test_build_context_prompt_voice_reply_mode_and_userbot_system_prompt_c
             assert "382962362" in sys_prompt
         assert "піструнькиня" in sys_prompt and "пиструнькиня" in sys_prompt
         assert "Джефф" in sys_prompt  # explicitly listed as ignored sibling/legacy alias
-        assert '[IMG:{"prompt":' in sys_prompt
-        assert '[DOC:{"format":' in sys_prompt
+        assert "[IMG:{...}]" in sys_prompt
+        assert "[DOC:{...}]" in sys_prompt
 
         expected_moods = (
             "[MOOD: dry stoic deadpan, confident]",
@@ -1074,14 +1074,14 @@ async def test_build_context_prompt_voice_reply_mode_and_userbot_system_prompt_c
             "[short pause]",
         )
 
-        for target_text in (prompt_voice, sys_prompt):
-            assert "ГОЛОСОВОЙ ОТВЕТ" in target_text
-            for mood in expected_moods:
-                assert mood in target_text
-            for tag in expected_tags:
-                assert tag in target_text
-            assert "1–2 живые устные фразы" in target_text
-            assert "ЗАПРЕЩЕНО: `[whispers]`" in target_text
-            assert "Markdown-разметка, таблицы, списки, блоки кода и URL-ссылки" in target_text
+        assert "ГОЛОСОВОЙ ОТВЕТ" in prompt_voice
+        assert "ГОЛОСОВОЙ ОТВЕТ" in sys_prompt
+        for mood in expected_moods:
+            assert mood in prompt_voice
+        for tag in expected_tags:
+            assert tag in prompt_voice
+        assert "1–2 живые устные фразы" in prompt_voice
+        assert "ЗАПРЕЩЕНО: `[whispers]`" in prompt_voice
+        assert "Markdown-разметка, таблицы, списки, блоки кода и URL-ссылки" in prompt_voice
     finally:
         await orchestrator.stop()

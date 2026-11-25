@@ -222,6 +222,38 @@ def _build_bot_name_set(bot_names: Optional[Sequence[str]]) -> Set[str]:
     return names
 
 
+def is_explicit_empty_fact_response(raw_result: Any) -> bool:
+    """Return True when LLM explicitly answered with an empty JSON array/object (0 durable facts)."""
+    if isinstance(raw_result, list):
+        return len(raw_result) == 0
+    if isinstance(raw_result, dict):
+        for key in ("facts", "operations"):
+            if isinstance(raw_result.get(key), list):
+                return len(raw_result[key]) == 0
+        return False
+    if isinstance(raw_result, str):
+        cleaned = raw_result.strip()
+        if not cleaned:
+            return False
+        fence_match = re.search(
+            r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        candidate = fence_match.group(1).strip() if fence_match else cleaned
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            return False
+        if isinstance(parsed, list):
+            return len(parsed) == 0
+        if isinstance(parsed, dict):
+            for key in ("facts", "operations"):
+                if isinstance(parsed.get(key), list):
+                    return len(parsed[key]) == 0
+    return False
+
+
 def strip_fact_id_tag(fact_text: str) -> Tuple[str, Optional[int]]:
     """Extract and strip trailing `(ID:12345)` / `(user_id: 12345)` suffix from fact text if present."""
     if not fact_text:
@@ -669,6 +701,7 @@ class CompactionEngine:
                 existing_facts = []
 
         facts_to_store: List[Dict[str, Any]] = []
+        llm_explicit_empty = False
 
         # 1. If summarize_fn provided, extract summary/upsert ops from substantive human transcript
         if self.summarize_fn:
@@ -679,7 +712,10 @@ class CompactionEngine:
                     existing_facts=existing_facts,
                     chat_id=chat_id,
                 )
-                facts_to_store.extend(self._parse_extracted_facts(raw_result))
+                if is_explicit_empty_fact_response(raw_result):
+                    llm_explicit_empty = True
+                else:
+                    facts_to_store.extend(self._parse_extracted_facts(raw_result))
             except Exception as exc:
                 logger.error(
                     "Error during summarization for chat %s: %s",
@@ -687,8 +723,8 @@ class CompactionEngine:
                     type(exc).__name__,
                 )
 
-        # 2. Deterministic fallback only when summarize_fn is None or failed/returned empty
-        if not facts_to_store:
+        # 2. Deterministic fallback ONLY when summarize_fn is None or failed/returned unstructured empty string
+        if not facts_to_store and not llm_explicit_empty:
             summary_fact = self._build_batch_summary_fact(substantive, friends_map=friends_map)
             if summary_fact:
                 facts_to_store.append(summary_fact)

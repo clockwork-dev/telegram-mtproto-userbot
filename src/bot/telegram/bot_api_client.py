@@ -441,6 +441,7 @@ class TelegramBotAPIClient:
         allowed_chat_ids: Optional[List[int]] = None,
         allowed_dm_user_ids: Optional[List[int]] = None,
         ignored_sender_usernames: Optional[List[str]] = None,
+        ignored_sender_ids: Optional[List[int]] = None,
         bot_names: Optional[List[str]] = None,
         typing_cpm: int = 300,
         typing_min_seconds: float = 1.0,
@@ -473,6 +474,10 @@ class TelegramBotAPIClient:
         self._ignored_sender_usernames_set = {
             u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
         }
+        self.ignored_sender_ids: List[int] = (
+            [int(uid) for uid in ignored_sender_ids] if ignored_sender_ids is not None else []
+        )
+        self._ignored_sender_ids_set = set(self.ignored_sender_ids)
         self.bot_names: List[str] = list(bot_names) if bot_names is not None else []
         self.typing_cpm = typing_cpm
         self.typing_min_seconds = typing_min_seconds
@@ -496,9 +501,10 @@ class TelegramBotAPIClient:
         allowed_chat_ids: Optional[List[int]] = None,
         allowed_dm_user_ids: Optional[List[int]] = None,
         ignored_sender_usernames: Optional[List[str]] = None,
+        ignored_sender_ids: Optional[List[int]] = None,
         bot_names: Optional[List[str]] = None,
     ) -> None:
-        """Synchronize group/DM allowlists, ignored usernames, and bot aliases."""
+        """Synchronize group/DM allowlists, ignored usernames/IDs, and bot aliases."""
         if allowed_chat_ids is not None:
             self.allowed_chat_ids = [int(cid) for cid in allowed_chat_ids]
             self._allowed_chat_ids_set = set(self.allowed_chat_ids)
@@ -510,6 +516,9 @@ class TelegramBotAPIClient:
             self._ignored_sender_usernames_set = {
                 u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
             }
+        if ignored_sender_ids is not None:
+            self.ignored_sender_ids = [int(uid) for uid in ignored_sender_ids]
+            self._ignored_sender_ids_set = set(self.ignored_sender_ids)
         if bot_names is not None:
             updated_names = list(bot_names)
             if self.bot_first_name and self.bot_first_name not in updated_names:
@@ -761,6 +770,8 @@ class TelegramBotAPIClient:
     def _convert_msg_dict(self, msg_dict: Dict[str, Any]) -> Optional[IncomingMessage]:
         ev = BotAPIMessageEvent(msg_dict, bot_id=self.bot_id)
         if ev.sender_is_bot:
+            return None
+        if ev.sender_id in self._ignored_sender_ids_set:
             return None
         if ev.sender_username and ev.sender_username.lower().lstrip("@") in self._ignored_sender_usernames_set:
             return None

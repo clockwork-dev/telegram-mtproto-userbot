@@ -52,6 +52,7 @@ from bot.memory.compaction import (
     CompactionEngine,
     build_compaction_prompt,
     canonicalize_subject,
+    is_explicit_empty_fact_response,
 )
 from bot.memory.db import ChatMessage, MemoryStore
 from bot.memory.embeddings import MemoryEmbedder, should_run_semantic_lookup
@@ -269,6 +270,7 @@ class GroupBotOrchestrator:
                     allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                     allowed_dm_user_ids=effective_dm_ids,
                     ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                    ignored_sender_ids=bot_cfg.telegram.ignored_sender_ids,
                     bot_names=bot_cfg.behavior.bot_names,
                     typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                     typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
@@ -295,6 +297,7 @@ class GroupBotOrchestrator:
                     allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                     allowed_dm_user_ids=effective_dm_ids,
                     ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                    ignored_sender_ids=bot_cfg.telegram.ignored_sender_ids,
                     bot_names=bot_cfg.behavior.bot_names,
                     typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                     typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
@@ -305,7 +308,10 @@ class GroupBotOrchestrator:
         self.config_mgr.register_reload_callback(self._on_config_reloaded)
 
         bot_uid = getattr(self.userbot, "bot_id", None)
-        excluded_uids = [int(bot_uid)] if bot_uid else None
+        excluded_uids_set = {int(uid) for uid in (bot_cfg.telegram.ignored_sender_ids or [])}
+        if bot_uid:
+            excluded_uids_set.add(int(bot_uid))
+        excluded_uids = sorted(excluded_uids_set) if excluded_uids_set else None
         refl_cfg = bot_cfg.memory.reflection
         eff_bot_names = self._effective_bot_subject_names(bot_cfg)
         engine_embedder = (
@@ -322,6 +328,7 @@ class GroupBotOrchestrator:
             threshold=bot_cfg.memory.compaction_threshold,
             batch_size=bot_cfg.memory.compaction_batch_size,
             excluded_user_ids=excluded_uids,
+            min_substantive_messages=bot_cfg.memory.compaction_min_substantive,
             friends_provider=self._get_friends_map,
             bot_names=eff_bot_names,
             embedder=engine_embedder,
@@ -501,13 +508,17 @@ class GroupBotOrchestrator:
         return isinstance(self.provider, (AntigravityProvider, AntigravityCLIClient))
 
     def _sync_bot_identity_to_memory_engines(self) -> None:
-        """Propagate resolved Telegram bot_id into compaction and reflection engines."""
+        """Propagate resolved Telegram bot_id and ignored_sender_ids into compaction and reflection engines."""
         bot_uid = getattr(self.userbot, "bot_id", None)
         if bot_uid:
             uid_int = int(bot_uid)
             self.compaction_engine.bot_id = uid_int
             self.compaction_engine.excluded_user_ids.add(uid_int)
             self.reflection_engine.bot_id = uid_int
+        bot_cfg = self.config_mgr.bot
+        if bot_cfg is not None:
+            for ign_uid in getattr(bot_cfg.telegram, "ignored_sender_ids", []) or []:
+                self.compaction_engine.excluded_user_ids.add(int(ign_uid))
 
     def _on_config_reloaded(self) -> None:
         """Synchronize Telegram access lists, voice/memory settings, image limiter, and secret sanitizer on reload."""
@@ -523,6 +534,9 @@ class GroupBotOrchestrator:
         if hasattr(self, "compaction_engine") and self.compaction_engine is not None:
             self.compaction_engine.threshold = bot_cfg.memory.compaction_threshold
             self.compaction_engine.batch_size = bot_cfg.memory.compaction_batch_size
+            self.compaction_engine.min_substantive_messages = (
+                bot_cfg.memory.compaction_min_substantive
+            )
             self.compaction_engine.bot_names = eff_bot_names
             self.compaction_engine.agreement_ttl_days = (
                 bot_cfg.memory.reflection.agreement_default_ttl_days
@@ -538,12 +552,21 @@ class GroupBotOrchestrator:
         if resolved_token:
             self.sanitizer.register_secret(resolved_token)
         if hasattr(self.userbot, "sync_access_lists"):
-            self.userbot.sync_access_lists(
-                allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
-                allowed_dm_user_ids=self._effective_dm_user_ids(bot_cfg),
-                ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
-                bot_names=bot_cfg.behavior.bot_names,
-            )
+            sync_kwargs: Dict[str, Any] = {
+                "allowed_chat_ids": bot_cfg.telegram.allowed_chat_ids,
+                "allowed_dm_user_ids": self._effective_dm_user_ids(bot_cfg),
+                "ignored_sender_usernames": bot_cfg.telegram.ignored_sender_usernames,
+                "bot_names": bot_cfg.behavior.bot_names,
+            }
+            try:
+                sig = inspect.signature(self.userbot.sync_access_lists)
+                if "ignored_sender_ids" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    sync_kwargs["ignored_sender_ids"] = bot_cfg.telegram.ignored_sender_ids
+            except (TypeError, ValueError):
+                pass
+            self.userbot.sync_access_lists(**sync_kwargs)
 
     async def send_sanitized_message(
         self,
@@ -706,6 +729,9 @@ class GroupBotOrchestrator:
                     for lang in stt_cfg.allowed_languages
                     if str(lang).strip()
                 )
+                self.stt_transcriber.idle_unload_seconds = max(
+                    0.0, float(getattr(stt_cfg, "idle_unload_seconds", 600.0) or 0.0)
+                )
                 self.stt_transcriber.ffmpeg_path = bot_cfg.media.ffmpeg_path
 
     async def _summarize_transcript_via_provider(
@@ -713,11 +739,11 @@ class GroupBotOrchestrator:
         transcript: str,
         existing_facts: Optional[Sequence[FactRecord]] = None,
         chat_id: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Optional[List[Dict[str, Any]]]:
         """Extract genuinely durable upsert fact operations from human conversation transcript using Antigravity."""
         if self._is_provider_rate_limited(role="compaction"):
             logger.info("Skipping compaction summarization while provider is rate-limited.")
-            return []
+            return None
         prompt = build_compaction_prompt(transcript, existing_facts=existing_facts)
         chosen_model: Optional[str] = None
         chosen_effort: Optional[str] = None
@@ -763,14 +789,17 @@ class GroupBotOrchestrator:
                 except Exception as rec_exc:
                     logger.debug("Failed to record compaction usage: %s", rec_exc)
             text = resp.text if hasattr(resp, "text") else str(resp)
-            return self.compaction_engine._parse_extracted_facts(text)
+            if is_explicit_empty_fact_response(text):
+                return []
+            parsed = self.compaction_engine._parse_extracted_facts(text)
+            return parsed if parsed else None
         except Exception as exc:
             logger.debug(
                 "Compaction summarization fallback triggered (chat=%s): %s",
                 chat_id,
                 exc,
             )
-            return []
+            return None
 
     async def _reflect_subject_via_provider(
         self,
@@ -1434,6 +1463,8 @@ class GroupBotOrchestrator:
         """Evaluate ReplyHeuristics across a single message or coalesced burst before media download."""
         spont_cfg = bot_cfg.behavior.spontaneous_replies
         active_cooldown = getattr(spont_cfg, "active_window_cooldown_seconds", None)
+        active_prob = getattr(spont_cfg, "active_window_probability", None)
+        ignored_ids = getattr(bot_cfg.telegram, "ignored_sender_ids", None)
 
         # 1. Check direct mention / reply-to-bot across all messages in the batch first
         effective_dm_ids = self._effective_dm_user_ids(bot_cfg)
@@ -1449,6 +1480,7 @@ class GroupBotOrchestrator:
                 allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                 allowed_dm_user_ids=effective_dm_ids,
                 ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                ignored_sender_ids=ignored_ids,
                 spontaneous_enabled=False,
                 in_quiet_hours=in_quiet,
                 time_since_last_bot_msg=time_since_bot,
@@ -1458,6 +1490,7 @@ class GroupBotOrchestrator:
                 active_conversation_window_seconds=float(spont_cfg.active_conversation_window_seconds),
                 max_per_hour=spont_cfg.max_per_hour,
                 active_window_cooldown_seconds=active_cooldown,
+                active_window_probability=active_prob,
                 now=now,
             )
             if res == ReplyAction.MUST_REPLY:
@@ -1508,6 +1541,7 @@ class GroupBotOrchestrator:
             allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
             allowed_dm_user_ids=effective_dm_ids,
             ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+            ignored_sender_ids=ignored_ids,
             spontaneous_enabled=spont_cfg.enabled,
             in_quiet_hours=in_quiet,
             time_since_last_bot_msg=time_since_bot,
@@ -1517,6 +1551,7 @@ class GroupBotOrchestrator:
             active_conversation_window_seconds=float(spont_cfg.active_conversation_window_seconds),
             max_per_hour=spont_cfg.max_per_hour,
             active_window_cooldown_seconds=active_cooldown,
+            active_window_probability=active_prob,
             now=now,
         )
         return decision, primary
@@ -1586,6 +1621,7 @@ class GroupBotOrchestrator:
         allowed_dm_ints = {int(uid) for uid in allowed_dms} if allowed_dms else set()
 
         bot_id = getattr(self.userbot, "bot_id", None)
+        ignored_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "ignored_sender_ids", []) or [])}
         ignored_usernames = {"hermes_kuk7yi6kfm3lcdfa_bot"}
         if bot_cfg.telegram.ignored_sender_usernames:
             ignored_usernames.update(
@@ -1598,6 +1634,8 @@ class GroupBotOrchestrator:
                 continue
             sender_id = getattr(raw, "sender_id", m.sender_id)
             if bot_id is not None and sender_id == bot_id:
+                continue
+            if sender_id is not None and int(sender_id) in ignored_ids:
                 continue
 
             # Anti-loop check on sender
@@ -1768,7 +1806,9 @@ class GroupBotOrchestrator:
                 imagine_match = self._find_imagine_command(working_messages)
                 if imagine_match is not None:
                     cmd_msg, cmd_res = imagine_match
-                    if cmd_res.addressed_to_other_bot:
+                    if cmd_res.addressed_to_other_bot or not self._is_slash_command_targeted(
+                        cmd_msg, bot_cfg
+                    ):
                         await self._save_incoming_batch(working_messages, now=now)
                         return None
                     if cmd_res.is_command:
@@ -1786,7 +1826,9 @@ class GroupBotOrchestrator:
                 ops_mode_match = self._find_ops_mode_command(working_messages)
                 if ops_mode_match is not None:
                     cmd_msg, action, addressed_to_other_bot = ops_mode_match
-                    if addressed_to_other_bot:
+                    if addressed_to_other_bot or not self._is_slash_command_targeted(
+                        cmd_msg, bot_cfg
+                    ):
                         await self._save_incoming_batch(working_messages, now=now)
                         return None
                     return await self._handle_ops_mode_command(
@@ -1802,7 +1844,9 @@ class GroupBotOrchestrator:
                 ops_action_match = self._find_ops_action_command(working_messages)
                 if ops_action_match is not None:
                     cmd_msg, cmd_name, cmd_arg, addressed_to_other_bot = ops_action_match
-                    if addressed_to_other_bot:
+                    if addressed_to_other_bot or not self._is_slash_command_targeted(
+                        cmd_msg, bot_cfg
+                    ):
                         await self._save_incoming_batch(working_messages, now=now)
                         return None
                     handled, action_reply = await self._handle_ops_action_command(
@@ -1927,11 +1971,40 @@ class GroupBotOrchestrator:
                 return
             self._sync_bot_identity_to_memory_engines()
             bot_uid = getattr(self.userbot, "bot_id", None)
-            excluded_uids = [int(bot_uid)] if bot_uid else None
+            self._sync_bot_identity_to_memory_engines()
+            bot_uid = getattr(self.userbot, "bot_id", None)
+            excl_set = (
+                {int(uid) for uid in (getattr(self.config_mgr.bot.telegram, "ignored_sender_ids", []) or [])}
+                if self.config_mgr.bot
+                else set()
+            )
+            if bot_uid:
+                excl_set.add(int(bot_uid))
+            excluded_uids = sorted(excl_set) if excl_set else None
             await self.compaction_engine.run_compaction_for_chat(
                 chat_id,
                 excluded_user_ids=excluded_uids,
             )
+
+    def _is_slash_command_targeted(self, cmd_msg: IncomingMessage, bot_cfg: BotConfig) -> bool:
+        """In shared groups, optionally require reply-to-bot or bot mention on bare slash commands."""
+        if not getattr(bot_cfg.telegram, "group_slash_commands_require_target", False):
+            return True
+        if self._is_private_dm_message(cmd_msg, bot_cfg):
+            return True
+        bot_id = getattr(self.userbot, "bot_id", None)
+        ev_obj = cmd_msg.raw_event if cmd_msg.raw_event is not None else cmd_msg
+        if bot_id is not None and self.heuristics.is_reply_to_bot(ev_obj, bot_id):
+            return True
+        candidate_text = cmd_msg.text or getattr(cmd_msg.raw_event, "caption", None) or ""
+        entities = getattr(ev_obj, "entities", None)
+        return self.heuristics.is_mention(
+            text=candidate_text,
+            bot_names=bot_cfg.behavior.bot_names,
+            bot_username=getattr(self.userbot, "bot_username", None),
+            entities=entities,
+            bot_id=bot_id,
+        )
 
     def _find_imagine_command(
         self,
@@ -2454,7 +2527,7 @@ class GroupBotOrchestrator:
             cmd_name = cmd_part.lower()
             norm_target = target_bot.strip().lstrip("@").lower()
             norm_self = (bot_username or "").strip().lstrip("@").lower()
-            if norm_target and norm_self and norm_target != norm_self:
+            if norm_target and (not norm_self or norm_target != norm_self):
                 return (cmd_name, arg, True)
         else:
             cmd_name = head.lower()
@@ -2960,9 +3033,10 @@ class GroupBotOrchestrator:
         )
 
         exclude_ids = {m.id for m in recent_history if m.id is not None}
-        exclude_users = (
-            {int(self.userbot.bot_id)} if self.userbot and self.userbot.bot_id else None
-        )
+        excl_user_set = {int(uid) for uid in (getattr(bot_cfg.telegram, "ignored_sender_ids", []) or [])}
+        if self.userbot and self.userbot.bot_id:
+            excl_user_set.add(int(self.userbot.bot_id))
+        exclude_users = excl_user_set or None
         archive_hits: List[ChatMessage] = []
         if hasattr(self.memory_store, "search_messages") and self._should_search_archive(
             combined_text

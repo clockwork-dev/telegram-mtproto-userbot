@@ -162,6 +162,7 @@ class TelegramUserbot:
         allowed_chat_ids: Optional[List[int]] = None,
         allowed_dm_user_ids: Optional[List[int]] = None,
         ignored_sender_usernames: Optional[List[str]] = None,
+        ignored_sender_ids: Optional[List[int]] = None,
         bot_names: Optional[List[str]] = None,
         typing_cpm: int = 300,
         typing_min_seconds: float = 1.0,
@@ -190,6 +191,10 @@ class TelegramUserbot:
         self._ignored_sender_usernames_set = {
             u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
         }
+        self.ignored_sender_ids: List[int] = (
+            [int(uid) for uid in ignored_sender_ids] if ignored_sender_ids is not None else []
+        )
+        self._ignored_sender_ids_set = set(self.ignored_sender_ids)
         self.bot_names: List[str] = list(bot_names) if bot_names is not None else []
         self.typing_cpm = typing_cpm
         self.typing_min_seconds = typing_min_seconds
@@ -247,6 +252,14 @@ class TelegramUserbot:
                             bot_names=self.bot_names,
                             bot_username=self.bot_username,
                         )
+                        if inc.sender_is_bot or inc.sender_id in self._ignored_sender_ids_set:
+                            continue
+                        if (
+                            inc.sender_username
+                            and inc.sender_username.lower().lstrip("@")
+                            in self._ignored_sender_usernames_set
+                        ):
+                            continue
                         await self.backlog_callback(inc)
                     except Exception as msg_err:
                         logger.debug(
@@ -317,6 +330,7 @@ class TelegramUserbot:
         allowed_chat_ids: Optional[List[int]] = None,
         allowed_dm_user_ids: Optional[List[int]] = None,
         ignored_sender_usernames: Optional[List[str]] = None,
+        ignored_sender_ids: Optional[List[int]] = None,
         bot_names: Optional[List[str]] = None,
     ) -> None:
         """Synchronize access control lists and bot aliases after config hot-reload."""
@@ -331,6 +345,9 @@ class TelegramUserbot:
             self._ignored_sender_usernames_set = {
                 u.lower().lstrip("@") for u in self.ignored_sender_usernames if u and u.strip()
             }
+        if ignored_sender_ids is not None:
+            self.ignored_sender_ids = [int(uid) for uid in ignored_sender_ids]
+            self._ignored_sender_ids_set = set(self.ignored_sender_ids)
         if bot_names is not None:
             self.bot_names = list(bot_names)
         if self._bot_api_client is not None and hasattr(self._bot_api_client, "sync_access_lists"):
@@ -338,12 +355,20 @@ class TelegramUserbot:
                 allowed_chat_ids=allowed_chat_ids,
                 allowed_dm_user_ids=allowed_dm_user_ids,
                 ignored_sender_usernames=ignored_sender_usernames,
+                ignored_sender_ids=ignored_sender_ids,
                 bot_names=bot_names,
             )
 
     async def _on_new_message(self, event: Any) -> None:
         """Internal Telethon event listener with chat whitelist and loop suppression."""
-        # 1. Anti-loop guard: Drop bot senders and ignored usernames
+        # 1. Anti-loop guard: Drop bot senders and ignored usernames/IDs
+        raw_sender_id = getattr(event, "sender_id", None)
+        if raw_sender_id is not None:
+            try:
+                if int(raw_sender_id) in self._ignored_sender_ids_set:
+                    return
+            except (TypeError, ValueError):
+                pass
         sender = getattr(event, "sender", None)
         raw_sender_is_bot = getattr(event, "sender_is_bot", False)
         sender_is_bot = raw_sender_is_bot is True
